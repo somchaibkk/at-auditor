@@ -571,6 +571,7 @@ export class SessionEngine {
 
   /** Generic internal API fetcher via page.evaluate (same-origin, session cookies) */
   private async fetchInternalApi(path: string): Promise<any> {
+    console.log(`[engine-session] fetchInternalApi: ${path.substring(0, 80)}...`);
     const result = await this.page.evaluate(async (url: string) => {
       try {
         const res = await fetch(url, {
@@ -579,12 +580,19 @@ export class SessionEngine {
             'x-requested-with': 'XMLHttpRequest',
           },
         });
-        if (!res.ok) return null;
+        if (!res.ok) {
+          return { __error: true, status: res.status, statusText: res.statusText, url };
+        }
         return await res.json();
-      } catch {
-        return null;
+      } catch (e: any) {
+        return { __error: true, message: e.message, url };
       }
     }, path);
+
+    if (result?.__error) {
+      console.error(`[engine-session] fetchInternalApi FAILED: ${JSON.stringify(result)}`);
+      return null;
+    }
     return result;
   }
 
