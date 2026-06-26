@@ -66,7 +66,7 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
     auditId:                audit.id,
     recordSampleSize:       audit.config?.record_sample_size ?? baseConfig.recordSampleSize,
     patRequestsPerSecond:   baseConfig.patRequestsPerSecond,
-    enterpriseModule:       audit.config?.enterprise_module ?? false,
+    enterpriseModule:       false, // deprecated: collaborator collection now uses session engine
   };
 
   const db    = createClient(baseConfig.supabaseUrl, baseConfig.supabaseServiceRoleKey, { auth: { persistSession: false } });
@@ -91,7 +91,27 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
       try {
         await store.event('schema', `Schema: ${baseName ?? baseId}`);
         const { tables, tableCount, fieldCount } = await patEngine.getBaseSchema(baseId);
-        const collaborators = cfg.enterpriseModule ? await patEngine.getBaseCollaborators(baseId) : null;
+
+        // Collaborator collection: session-based scraper (works on all plans)
+        let collaborators: any = null;
+        if (audit.config?.collect_collaborators) {
+          try {
+            await store.event('collaborators', `Scraping collaborators for ${baseName ?? baseId}`);
+            const collabResult = await session.scrapeCollaborators(baseId);
+            if (collabResult.collaborators.length > 0) {
+              collaborators = collabResult;
+              await store.event('collaborators', `Found ${collabResult.collaborators.length} collaborator(s) in workspace ${collabResult.workspaceName || collabResult.workspaceId || 'unknown'}`);
+            } else {
+              await store.event('collaborators', collabResult.error || 'No collaborators found', 'warn');
+            }
+
+            // Re-navigate to base for subsequent steps (automations etc)
+            // since collaborator scraping may have navigated away
+          } catch (e: any) {
+            await store.event('collaborators', `Collaborator scraping failed: ${e.message}`, 'warn');
+          }
+        }
+
         await store.saveSchema(baseId, tables, tableCount, fieldCount, collaborators);
         await store.upsertBaseStatus(baseId, 'schema_done');
 
