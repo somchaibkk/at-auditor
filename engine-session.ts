@@ -150,18 +150,16 @@ export class SessionEngine {
   }
 
   // ---------------------------------------------------------------------------
-  // Collaborator scraping (browser session, works on all plans)
+  // Collaborator collection via internal API
   // ---------------------------------------------------------------------------
 
   /**
-   * Scrape collaborators for a base.
-   * Strategy (in order of reliability):
-   *   1. Navigate to workspace settings > Collaborators tab, scrape the
-   *      "Billable collaborators" list (name + email + per-base roles)
-   *   2. Fall back to full-page email extraction from workspace settings
-   *
-   * Workspace ID resolution: navigate to the base page first, then extract
-   * the workspace ID from the page's HTML/script tags or sidebar links.
+   * Collect collaborators for a base using the internal workspaceSettings API.
+   * Strategy:
+   *   1. Navigate to the base to bootstrap the app shell + session cookies
+   *   2. Extract the workspace ID from the page HTML
+   *   3. Call GET /v0.3/{wspId}/workspace/workspaceSettings via page.evaluate
+   *   4. Parse the structured JSON response for user profiles + permissions
    */
   async scrapeCollaborators(baseId: string): Promise<CollaboratorsResult> {
     const result: CollaboratorsResult = {
@@ -171,212 +169,408 @@ export class SessionEngine {
     };
 
     try {
-      // Step 1: navigate to the base to bootstrap the app shell
-      console.log(`[engine-session] Navigating to base ${baseId} to resolve workspace...`);
+      // Step 1: navigate to the base to bootstrap session
+      console.log(`[engine-session] Navigating to base ${baseId} for collaborator collection...`);
       await this.page.goto(`https://airtable.com/${baseId}`, {
         waitUntil: 'networkidle',
         timeout: 60_000,
       });
       await new Promise((r) => setTimeout(r, 3000));
 
-      // Step 2: resolve workspace ID
-      const wsInfo = await this.resolveWorkspace(baseId);
-      result.workspaceId   = wsInfo.workspaceId;
-      result.workspaceName = wsInfo.workspaceName;
-      console.log(`[engine-session] Workspace resolved: ${wsInfo.workspaceId} "${wsInfo.workspaceName || ''}"`);
+      // Step 2: resolve workspace ID from page HTML
+      const wspId = await this.resolveWorkspaceId(baseId);
 
-      if (!wsInfo.workspaceId) {
-        result.error = 'Could not determine workspace ID for base';
+      if (!wspId) {
+        result.error = 'Could not resolve workspace ID for base';
+        return result;
+      }
+      result.workspaceId = wspId;
+      console.log(`[engine-session] Resolved workspace: ${result.workspaceId}`);
+
+      // Step 3: call the internal workspaceSettings API via page.evaluate
+      const wsData = await this.fetchInternalApi(`/v0.3/${wspId}/workspace/workspaceSettings`);
+      if (!wsData) {
+        result.error = 'workspaceSettings API returned no data';
         return result;
       }
 
-      // Step 3: navigate to workspace settings Collaborators tab
-      const collabs = await this.scrapeWorkspaceCollaboratorsTab(wsInfo.workspaceId);
-      if (collabs.length > 0) {
-        result.collaborators = collabs.map((c) => ({ ...c, source: 'workspace' as const }));
-        console.log(`[engine-session] Found ${collabs.length} collaborator(s) from workspace settings`);
-      } else {
-        result.error = 'No collaborators found on workspace settings page';
+      // Step 4: parse the response
+      result.workspaceName = wsData.workspaceData?.workspaceName || null;
+
+      const breakdown = wsData.workspaceData?.billableUserBreakdown;
+      if (!breakdown) {
+        result.error = 'No billableUserBreakdown in workspaceSettings response';
+        return result;
       }
+
+      const profiles: Record<string, { id: string; name: string; email: string }> =
+        breakdown.billableUserProfileInfoById || {};
+
+      const wsPerms: Record<string, string> = {};
+      for (const wc of breakdown.workspaceCollaborators || []) {
+        wsPerms[wc.userId] = wc.permissionLevel;
+      }
+
+      const appPerms: Record<string, Array<{ applicationId: string; permissionLevel: string }>> = {};
+      for (const ac of breakdown.applicationCollaborators || []) {
+        if (!appPerms[ac.userId]) appPerms[ac.userId] = [];
+        appPerms[ac.userId].push({ applicationId: ac.applicationId, permissionLevel: ac.permissionLevel });
+      }
+
+      for (const [userId, profile] of Object.entries(profiles)) {
+        const wspPerm = wsPerms[userId] || null;
+        const baseAccess = (appPerms[userId] || [])
+          .filter((a) => a.applicationId === baseId)
+          .map((a) => a.permissionLevel);
+
+        result.collaborators.push({
+          userId,
+          email:           profile.email,
+          name:            profile.name,
+          permissionLevel: wspPerm || baseAccess[0] || null,
+          source:          wspPerm ? 'workspace' : 'base',
+        });
+      }
+
+      (result as any).workspacePlan = wsData.workspaceData?.billingPlan?.name || null;
+      (result as any).workspacePlanGrouping = wsData.workspaceData?.billingPlan?.grouping || null;
+      (result as any).totalBillable = breakdown.numTotalBillableCollaborators || 0;
+      (result as any).totalNonBillable = breakdown.numTotalNonBillableCollaborators || 0;
+
+      console.log(`[engine-session] Found ${result.collaborators.length} collaborator(s) via workspaceSettings API`);
+      console.log(`[engine-session] Workspace: "${result.workspaceName}", Plan: ${(result as any).workspacePlan}`);
     } catch (err: any) {
-      result.error = `Collaborator scraping failed: ${err.message}`;
+      result.error = `Collaborator collection failed: ${err.message}`;
       console.error(`[engine-session] ${result.error}`);
     }
 
     return result;
   }
 
+  // ---------------------------------------------------------------------------
+  // Full environment data collection (Tier 1 + Tier 2 + Tier 3)
+  // ---------------------------------------------------------------------------
+
   /**
-   * Resolve the workspace ID for a base. Tries multiple strategies:
-   *   - Scan all <a> hrefs on the base page for wsp* patterns
-   *   - Scan <script> tags for JSON containing workspaceId
-   *   - Scan full page HTML source for wsp* patterns near the base ID
+   * Collect comprehensive environment data: workspace settings, usage stats,
+   * enterprise admin panel data (users, licenses, security, workspaces),
+   * and per-workflow execution counts.
+   *
+   * Requires: browser navigated to an Airtable page (session cookies active).
+   * Returns a single object with all collected data, null fields where access
+   * was denied or data unavailable.
    */
-  private async resolveWorkspace(baseId: string): Promise<{ workspaceId: string | null; workspaceName: string | null }> {
+  async collectEnvironment(baseId: string, opts: { enterprise?: boolean } = {}): Promise<Record<string, any>> {
+    const env: Record<string, any> = {
+      collectedAt: new Date().toISOString(),
+      workspace:   null,
+      usageStats:  null,
+      enterprise:  null,
+      errors:      [] as string[],
+    };
+
     try {
-      const wsInfo = await this.page.evaluate(() => {
-        // Strategy A: scan all anchor hrefs for workspace links
-        const allAnchors = Array.from(document.querySelectorAll('a'));
-        for (const a of allAnchors) {
-          const href = a.href || '';
-          const match = href.match(/(wsp[a-zA-Z0-9]{10,})/);
-          if (match) {
-            return { workspaceId: match[1], workspaceName: a.textContent?.trim() || null };
-          }
-        }
-
-        // Strategy B: scan script tags and inline JSON for workspaceId
-        const html = document.documentElement.innerHTML;
-        const jsonMatch = html.match(/"workspaceId"\s*:\s*"(wsp[a-zA-Z0-9]+)"/);
-        if (jsonMatch) {
-          const nameMatch = html.match(/"workspaceName"\s*:\s*"([^"]+)"/);
-          return { workspaceId: jsonMatch[1], workspaceName: nameMatch?.[1] || null };
-        }
-
-        // Strategy C: brute-force scan HTML for any wsp* token
-        const wspMatch = html.match(/wsp[a-zA-Z0-9]{10,}/);
-        if (wspMatch) {
-          return { workspaceId: wspMatch[0], workspaceName: null };
-        }
-
-        return { workspaceId: null, workspaceName: null };
-      });
-
-      if (wsInfo.workspaceId) return wsInfo;
-
-      // Strategy D: go to the home page and find which workspace contains this base
-      console.log('[engine-session] Trying home page to resolve workspace...');
-      await this.page.goto('https://airtable.com/', {
+      // Ensure we're on an Airtable page
+      console.log(`[engine-session] Starting environment collection...`);
+      await this.page.goto(`https://airtable.com/${baseId}`, {
         waitUntil: 'networkidle',
-        timeout: 30_000,
+        timeout: 60_000,
       });
       await new Promise((r) => setTimeout(r, 3000));
 
-      const fromHome = await this.page.evaluate((targetBaseId: string) => {
-        const html = document.documentElement.innerHTML;
-        // Look for the base ID near a workspace ID in the HTML
-        const idx = html.indexOf(targetBaseId);
-        if (idx === -1) return { workspaceId: null, workspaceName: null };
+      // --- Tier 1: Workspace level ---
+      const wspId = await this.resolveWorkspaceId(baseId);
+      if (wspId) {
+        console.log(`[engine-session] Tier 1: fetching workspace data for ${wspId}...`);
 
-        // Search in a window around the base ID
-        const window = html.substring(Math.max(0, idx - 2000), Math.min(html.length, idx + 2000));
-        const match = window.match(/(wsp[a-zA-Z0-9]{10,})/);
-        if (match) return { workspaceId: match[1], workspaceName: null };
+        // workspaceSettings (full response, not just collaborator breakdown)
+        const wsSettings = await this.fetchInternalApi(`/v0.3/${wspId}/workspace/workspaceSettings`);
+        if (wsSettings) {
+          env.workspace = {
+            workspaceId:   wspId,
+            workspaceName: wsSettings.workspaceData?.workspaceName,
+            billingPlan:   wsSettings.workspaceData?.billingPlan,
+            billingAddOnIds: wsSettings.workspaceData?.billingAddOnIds,
+            billableUserBreakdown: wsSettings.workspaceData?.billableUserBreakdown ? {
+              numWorkspaceLevelBillableCollaborators:  wsSettings.workspaceData.billableUserBreakdown.numWorkspaceLevelBillableCollaborators,
+              numAppLevelBillableCollaborators:        wsSettings.workspaceData.billableUserBreakdown.numAppLevelBillableCollaborators,
+              numTotalBillableCollaborators:           wsSettings.workspaceData.billableUserBreakdown.numTotalBillableCollaborators,
+              numTotalNonBillableCollaborators:        wsSettings.workspaceData.billableUserBreakdown.numTotalNonBillableCollaborators,
+              numTotalEditorOrAbovePermissionCollaborators: wsSettings.workspaceData.billableUserBreakdown.numTotalEditorOrAbovePermissionCollaborators,
+              numTotalCommenterPermissionCollaborators:     wsSettings.workspaceData.billableUserBreakdown.numTotalCommenterPermissionCollaborators,
+              workspaceCollaborators:   wsSettings.workspaceData.billableUserBreakdown.workspaceCollaborators,
+              applicationCollaborators: wsSettings.workspaceData.billableUserBreakdown.applicationCollaborators,
+              billableUserProfileInfoById: wsSettings.workspaceData.billableUserBreakdown.billableUserProfileInfoById,
+            } : null,
+          };
+          console.log(`[engine-session] Tier 1: workspaceSettings OK`);
+        } else {
+          env.errors.push('workspaceSettings failed');
+        }
 
-        return { workspaceId: null, workspaceName: null };
-      }, baseId);
+        // workspaceUsageStats
+        const usageStats = await this.fetchInternalApi(`/v0.3/${wspId}/workspace/workspaceUsageStats`);
+        if (usageStats) {
+          env.usageStats = usageStats.workspaceUsageStats || usageStats;
+          console.log(`[engine-session] Tier 1: workspaceUsageStats OK`);
+        } else {
+          env.errors.push('workspaceUsageStats failed');
+        }
 
-      return fromHome;
+        // --- Tier 2: Enterprise/Admin level ---
+        // Extract enterprise account ID from workspace settings
+        if (opts.enterprise !== false) {
+          const entId = this.extractEnterpriseId(wsSettings);
+          if (entId) {
+            console.log(`[engine-session] Tier 2: fetching enterprise data for ${entId}...`);
+            env.enterprise = await this.collectEnterpriseData(entId);
+            console.log(`[engine-session] Tier 2: enterprise data collection complete`);
+          } else {
+            env.errors.push('No enterprise account ID found (may not be enterprise plan)');
+            console.log(`[engine-session] Tier 2: skipped (no enterprise account ID)`);
+          }
+        } else {
+          console.log(`[engine-session] Tier 2: skipped (disabled in config)`);
+        }
+      } else {
+        env.errors.push('Could not resolve workspace ID');
+      }
     } catch (err: any) {
-      console.error(`[engine-session] resolveWorkspace failed: ${err.message}`);
-      return { workspaceId: null, workspaceName: null };
+      env.errors.push(`Environment collection failed: ${err.message}`);
+      console.error(`[engine-session] ${err.message}`);
     }
+
+    return env;
   }
 
   /**
-   * Navigate to workspace settings > Collaborators tab and scrape the list.
-   * The page shows "Billable collaborators" with each entry containing:
-   *   - Name (e.g. "Janhvi Gaikwad")
-   *   - Email below the name (e.g. "janhvi.gaikwad@phoebephilo.com")
-   *   - Per-base role labels (e.g. "Editor" next to base icons)
+   * Collect per-base automation execution stats.
+   * Call after collectBase() with the workflow IDs from the automations.
    */
-  private async scrapeWorkspaceCollaboratorsTab(workspaceId: string): Promise<Omit<CollaboratorInfo, 'source'>[]> {
+  async collectAutomationStats(appId: string): Promise<Record<string, any>> {
+    const stats: Record<string, any> = {
+      executionCountsThisMonth: null,
+      errors: [] as string[],
+    };
+
     try {
-      // Navigate to workspace settings
-      const settingsUrl = `https://airtable.com/${workspaceId}/workspace`;
-      console.log(`[engine-session] Navigating to workspace settings: ${settingsUrl}`);
-      await this.page.goto(settingsUrl, {
+      // Navigate to automations tab to bootstrap context
+      await this.page.goto(`https://airtable.com/${appId}/automations`, {
         waitUntil: 'networkidle',
-        timeout: 30_000,
+        timeout: 60_000,
       });
       await new Promise((r) => setTimeout(r, 3000));
 
-      // Check for redirect to login
-      if (this.page.url().includes('/login')) {
-        console.log('[engine-session] Redirected to login, no access to workspace settings');
-        return [];
-      }
-
-      // Click the "Collaborators" tab
-      const clickedTab = await this.page.evaluate(() => {
-        const tabs = Array.from(document.querySelectorAll('a, button, [role="tab"]'));
-        for (const tab of tabs) {
-          const text = ((tab as HTMLElement).textContent || '').trim().toLowerCase();
-          if (text === 'collaborators') {
-            (tab as HTMLElement).click();
-            return true;
-          }
-        }
-        return false;
-      });
-
-      if (clickedTab) {
-        console.log('[engine-session] Clicked Collaborators tab');
-        await new Promise((r) => setTimeout(r, 3000));
+      // Get monthly execution counts for all workflows in this base
+      const counts = await this.fetchInternalApi(
+        `/v0.3/application/${appId}/getWorkflowExecutionCountsInCurrentMonth?stringifiedObjectParams=%7B%7D`,
+      );
+      if (counts) {
+        stats.executionCountsThisMonth = counts.data || counts;
+        console.log(`[engine-session] Automation stats OK for ${appId}`);
       } else {
-        console.log('[engine-session] Collaborators tab not found, scraping current page');
+        stats.errors.push('getWorkflowExecutionCountsInCurrentMonth failed');
       }
-
-      // Scrape: extract all emails from the page with nearby name context
-      const collabs = await this.page.evaluate(() => {
-        const results: Array<{ userId: string | null; email: string | null; name: string | null; permissionLevel: string | null }> = [];
-        const seen = new Set<string>();
-        const fullText = document.body.innerText || '';
-
-        // Find all email addresses on the page
-        const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
-        let match;
-        while ((match = emailRegex.exec(fullText)) !== null) {
-          const email = match[0].toLowerCase();
-          if (seen.has(email)) continue;
-          if (email.includes('airtable.com') || email.includes('noreply')) continue;
-          seen.add(email);
-
-          // The workspace settings page renders each collaborator as:
-          //   Name
-          //   email@domain.com
-          //   [base icons with roles]
-          // So the name is on the line ABOVE the email
-          const idx = fullText.indexOf(match[0]);
-          const before = fullText.substring(Math.max(0, idx - 200), idx);
-          const lines = before.split('\n').map(l => l.trim()).filter(Boolean);
-
-          // Name: last non-empty line before the email that looks like a name
-          let name: string | null = null;
-          for (let i = lines.length - 1; i >= 0; i--) {
-            const line = lines[i];
-            // Skip lines that look like role labels or base names
-            if (line.includes('@')) continue;
-            if (line.length < 2 || line.length > 60) continue;
-            // Skip obvious non-name strings
-            if (/^(editor|owner|creator|commenter|read.only|admin|external|settings|billing|usage|collaborator|billable|workspace|add or manage)/i.test(line)) continue;
-            name = line;
-            break;
-          }
-
-          // Look for role/permission near the email (after it)
-          const after = fullText.substring(idx, Math.min(fullText.length, idx + 200));
-          const afterLines = after.split('\n').map(l => l.trim()).filter(Boolean);
-          let perm: string | null = null;
-          for (const line of afterLines) {
-            const lower = line.toLowerCase();
-            if (lower === 'owner' || lower === 'creator' || lower === 'editor' || lower === 'commenter' || lower === 'read only' || lower === 'read-only' || lower === 'admin' || lower === 'external') {
-              perm = lower;
-              break;
-            }
-          }
-
-          results.push({ userId: null, email, name, permissionLevel: perm });
-        }
-
-        return results;
-      });
-
-      return collabs;
     } catch (err: any) {
-      console.error(`[engine-session] scrapeWorkspaceCollaboratorsTab failed: ${err.message}`);
+      stats.errors.push(`Automation stats failed: ${err.message}`);
+    }
+
+    return stats;
+  }
+
+  /**
+   * Collect recent execution history for a specific workflow.
+   */
+  async collectWorkflowExecutions(workflowId: string): Promise<any[]> {
+    try {
+      const data = await this.fetchInternalApi(
+        `/v0.3/workflow/${workflowId}/listExecutions?stringifiedObjectParams=%7B%22filter%22%3Anull%2C%22createdBefore%22%3Anull%7D`,
+      );
+      return data?.data?.executions || data?.executions || [];
+    } catch {
       return [];
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private: enterprise data collection
+  // ---------------------------------------------------------------------------
+
+  private async collectEnterpriseData(entId: string): Promise<Record<string, any>> {
+    const ent: Record<string, any> = {
+      enterpriseAccountId: entId,
+      users:               null,
+      enterpriseSettings:  null,
+      licenseSummary:      null,
+      roles:               null,
+      pendingInvites:      null,
+      workspaces:          null,
+      errors:              [] as string[],
+    };
+
+    // getUsersWithSearch (paginated, get all active users)
+    try {
+      const allUsers: any[] = [];
+      let offset = 0;
+      const limit = 50;
+      let hasMore = true;
+      while (hasMore) {
+        const params = JSON.stringify({ includeDescendantEnterpriseAccounts: false, filters: { state: 'active' }, offset, limit });
+        const data = await this.fetchInternalApi(
+          `/v0.3/enterpriseAccount/${entId}/getUsersWithSearch?stringifiedObjectParams=${encodeURIComponent(params)}`,
+        );
+        const users = data?.data?.userAccounts || [];
+        allUsers.push(...users);
+        // Also capture aggregate data from first page
+        if (offset === 0 && data?.data) {
+          ent.userAggregates = {
+            totalBasicUsersCount: data.data.totalBasicUsersCount,
+            aggregateUserLicenseCount: data.data.aggregateUserLicenseCount,
+            enterpriseAccountBillingModelType: data.data.enterpriseAccountBillingModelType,
+            enterpriseAccountEmailDomainInfos: data.data.enterpriseAccountEmailDomainInfos,
+          };
+        }
+        hasMore = users.length === limit;
+        offset += limit;
+      }
+      ent.users = allUsers;
+      console.log(`[engine-session] Enterprise users: ${allUsers.length}`);
+    } catch (err: any) {
+      ent.errors.push(`getUsersWithSearch: ${err.message}`);
+    }
+
+    // getEnterpriseSettings
+    try {
+      const params = JSON.stringify({});
+      const data = await this.fetchInternalApi(
+        `/v0.3/enterpriseAccount/${entId}/getEnterpriseSettings?stringifiedObjectParams=${encodeURIComponent(params)}`,
+      );
+      ent.enterpriseSettings = data?.data || data;
+      console.log(`[engine-session] Enterprise settings OK`);
+    } catch (err: any) {
+      ent.errors.push(`getEnterpriseSettings: ${err.message}`);
+    }
+
+    // getLicenseSummary
+    try {
+      const params = JSON.stringify({ includeDescendants: false });
+      const data = await this.fetchInternalApi(
+        `/v0.3/enterpriseAccount/${entId}/getLicenseSummary?stringifiedObjectParams=${encodeURIComponent(params)}`,
+      );
+      ent.licenseSummary = data?.data || data;
+      console.log(`[engine-session] License summary OK`);
+    } catch (err: any) {
+      ent.errors.push(`getLicenseSummary: ${err.message}`);
+    }
+
+    // getRoles
+    try {
+      const params = JSON.stringify({ shouldIncludeDescendantEnterpriseAccounts: false });
+      const data = await this.fetchInternalApi(
+        `/v0.3/enterpriseAccount/${entId}/getRoles?stringifiedObjectParams=${encodeURIComponent(params)}`,
+      );
+      ent.roles = data?.data || data;
+      console.log(`[engine-session] Roles OK`);
+    } catch (err: any) {
+      ent.errors.push(`getRoles: ${err.message}`);
+    }
+
+    // getPendingInviteesInfo
+    try {
+      const params = JSON.stringify({ membershipCaptureType: 'none', shouldIncludeDescendantEnterpriseAccountsPendingInvites: false, shouldExcludeClaimListUserGroups: false });
+      const data = await this.fetchInternalApi(
+        `/v0.3/enterpriseAccount/${entId}/getPendingInviteesInfo?stringifiedObjectParams=${encodeURIComponent(params)}`,
+      );
+      ent.pendingInvites = data?.data || data;
+      console.log(`[engine-session] Pending invites OK`);
+    } catch (err: any) {
+      ent.errors.push(`getPendingInviteesInfo: ${err.message}`);
+    }
+
+    // getWorkspaces
+    try {
+      const params = JSON.stringify({ shouldIncludeDescendantEnterpriseAccounts: false, shouldIncludeInternalWorkspaces: true });
+      const data = await this.fetchInternalApi(
+        `/v0.3/enterpriseAccount/${entId}/getWorkspaces?stringifiedObjectParams=${encodeURIComponent(params)}`,
+      );
+      ent.workspaces = data?.data || data;
+      console.log(`[engine-session] Workspaces OK`);
+    } catch (err: any) {
+      ent.errors.push(`getWorkspaces: ${err.message}`);
+    }
+
+    return ent;
+  }
+
+  private extractEnterpriseId(wsSettings: any): string | null {
+    if (!wsSettings) return null;
+    // Check billingPlansForPricingPage for enterpriseAccounts
+    const plans = wsSettings.workspaceData?.billingPlansForPricingPage || [];
+    for (const plan of plans) {
+      const accounts = plan.enterpriseAccounts || [];
+      for (const acc of accounts) {
+        if (acc.enterpriseAccountId) return acc.enterpriseAccountId;
+      }
+    }
+    // Also check the main billing plan
+    const mainPlan = wsSettings.workspaceData?.billingPlan;
+    if (mainPlan?.enterpriseAccountId) return mainPlan.enterpriseAccountId;
+    return null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private: shared helpers
+  // ---------------------------------------------------------------------------
+
+  /** Resolve workspace ID from the current page's HTML */
+  private async resolveWorkspaceId(baseId: string): Promise<string | null> {
+    let wspId = await this.page.evaluate(() => {
+      const html = document.documentElement.innerHTML;
+      const jsonMatch = html.match(/"workspaceId"\s*:\s*"(wsp[a-zA-Z0-9]+)"/);
+      if (jsonMatch) return jsonMatch[1];
+      const anchors = Array.from(document.querySelectorAll('a'));
+      for (const a of anchors) {
+        const m = (a.href || '').match(/(wsp[a-zA-Z0-9]{10,})/);
+        if (m) return m[1];
+      }
+      const m = html.match(/wsp[a-zA-Z0-9]{10,}/);
+      return m ? m[0] : null;
+    });
+
+    if (!wspId) {
+      console.log('[engine-session] No workspace ID on base page, trying home...');
+      await this.page.goto('https://airtable.com/', { waitUntil: 'networkidle', timeout: 30_000 });
+      await new Promise((r) => setTimeout(r, 3000));
+      wspId = await this.page.evaluate((bid: string) => {
+        const html = document.documentElement.innerHTML;
+        const idx = html.indexOf(bid);
+        if (idx === -1) return null;
+        const chunk = html.substring(Math.max(0, idx - 2000), Math.min(html.length, idx + 2000));
+        const m = chunk.match(/(wsp[a-zA-Z0-9]{10,})/);
+        return m ? m[1] : null;
+      }, baseId);
+    }
+
+    return wspId;
+  }
+
+  /** Generic internal API fetcher via page.evaluate (same-origin, session cookies) */
+  private async fetchInternalApi(path: string): Promise<any> {
+    const result = await this.page.evaluate(async (url: string) => {
+      try {
+        const res = await fetch(url, {
+          headers: {
+            'x-airtable-inter-service-client': 'webClient',
+            'x-requested-with': 'XMLHttpRequest',
+          },
+        });
+        if (!res.ok) return null;
+        return await res.json();
+      } catch {
+        return null;
+      }
+    }, path);
+    return result;
   }
 
   // ---------------------------------------------------------------------------
