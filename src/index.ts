@@ -109,6 +109,43 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
     // Start session headless -- login was done separately via /login endpoint
     await session.startHeadless(baseConfig.browserProfileDir);
 
+    // --- Environment data collection (once per audit, not per base) ---
+    const wantEnv        = audit.config?.collect_environment !== false && audit.config?.collect_collaborators;
+    const wantEnterprise = audit.config?.collect_enterprise === true;
+    const wantAutoStats  = audit.config?.collect_auto_stats !== false && audit.config?.collect_collaborators;
+
+    if (wantEnv || wantEnterprise) {
+      try {
+        const firstBase = targets[0];
+        if (firstBase) {
+          await store.event('environment', 'Collecting environment data...');
+          const envData = await session.collectEnvironment(firstBase.baseId, { enterprise: wantEnterprise });
+
+          const envErrors = (envData.errors as string[]) || [];
+          const entErrors = (envData.enterprise?.errors as string[]) || [];
+          const allErrors = [...envErrors, ...entErrors].filter(Boolean);
+
+          if (envData.workspace) {
+            await store.event('environment', `Workspace: ${envData.workspace.workspaceName || 'unknown'}, Plan: ${envData.workspace.billingPlan?.name || 'unknown'}`);
+          }
+          if (envData.enterprise?.users) {
+            await store.event('environment', `Enterprise: ${envData.enterprise.users.length} user(s)`);
+          }
+          if (envData.usageStats) {
+            await store.event('environment', `Usage: ${envData.usageStats.numWorkflowExecutions || 0} workflow executions this month`);
+          }
+          if (allErrors.length > 0) {
+            await store.event('environment', `Warnings: ${allErrors.join('; ')}`, 'warn');
+          }
+
+          await store.saveEnvironmentData(envData);
+          await store.event('environment', 'Environment data saved');
+        }
+      } catch (e: any) {
+        await store.event('environment', `Environment collection failed: ${e.message}`, 'warn');
+      }
+    }
+
     for (const { baseId, baseName } of targets) {
       try {
         await store.event('schema', `Schema: ${baseName ?? baseId}`);
@@ -152,6 +189,18 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
           await store.saveAutomations(baseId, collected.automations);
           const scriptCount = collected.automations.reduce((n, a) => n + a.scriptSources.length, 0);
           await store.event('automations', `Found ${collected.automations.length} automation(s), ${scriptCount} script(s)`);
+
+          // Collect automation execution stats
+          if (wantAutoStats) {
+            try {
+              const autoStats = await session.collectAutomationStats(baseId);
+              await store.saveAutomationStats(baseId, autoStats);
+              await store.event('automations', `Execution stats collected for ${baseName ?? baseId}`);
+            } catch (e: any) {
+              await store.event('automations', `Execution stats failed: ${e.message}`, 'warn');
+            }
+          }
+
           await store.upsertBaseStatus(baseId, 'automations_done');
         }
 

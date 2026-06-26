@@ -135,6 +135,27 @@ export class Store {
   }
 
   // ---------------------------------------------------------------------------
+  // Environment data (Engine 2: workspace + enterprise + usage)
+  // ---------------------------------------------------------------------------
+
+  async saveEnvironmentData(data: Record<string, any>) {
+    await this.db.from('environment_data').upsert(
+      {
+        audit_id: this.cfg.auditId,
+        data,
+      },
+      { onConflict: 'audit_id' },
+    );
+  }
+
+  async saveAutomationStats(baseId: string, stats: Record<string, any>) {
+    // Store automation stats alongside the base schema
+    await this.db.from('base_schemas').update({
+      automation_stats: stats,
+    }).eq('audit_id', this.cfg.auditId).eq('base_id', baseId);
+  }
+
+  // ---------------------------------------------------------------------------
   // Query
   // ---------------------------------------------------------------------------
 
