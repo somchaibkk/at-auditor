@@ -169,15 +169,8 @@ export class SessionEngine {
     };
 
     try {
-      // Step 1: navigate to the base to bootstrap session
-      console.log(`[engine-session] Navigating to base ${baseId} for collaborator collection...`);
-      await this.page.goto(`https://airtable.com/${baseId}`, {
-        waitUntil: 'networkidle',
-        timeout: 60_000,
-      });
-      await new Promise((r) => setTimeout(r, 3000));
-
-      // Step 2: resolve workspace ID from page HTML
+      // Step 1: resolve workspace ID (navigates to base page internally)
+      console.log(`[engine-session] Resolving workspace for base ${baseId}...`);
       const wspId = await this.resolveWorkspaceId(baseId);
 
       if (!wspId) {
@@ -270,15 +263,8 @@ export class SessionEngine {
     };
 
     try {
-      // Ensure we're on an Airtable page
-      console.log(`[engine-session] Starting environment collection...`);
-      await this.page.goto(`https://airtable.com/${baseId}`, {
-        waitUntil: 'networkidle',
-        timeout: 60_000,
-      });
-      await new Promise((r) => setTimeout(r, 3000));
-
       // --- Tier 1: Workspace level ---
+      console.log(`[engine-session] Starting environment collection...`);
       const wspId = await this.resolveWorkspaceId(baseId);
       if (wspId) {
         console.log(`[engine-session] Tier 1: fetching workspace data for ${wspId}...`);
@@ -524,32 +510,61 @@ export class SessionEngine {
 
   /** Resolve workspace ID from the current page's HTML */
   private async resolveWorkspaceId(baseId: string): Promise<string | null> {
+    // Navigate to the automations page (known to fully bootstrap the app shell)
+    await this.page.goto(`https://airtable.com/${baseId}/automations`, {
+      waitUntil: 'networkidle',
+      timeout: 60_000,
+    });
+    await new Promise((r) => setTimeout(r, 5000));
+
     let wspId = await this.page.evaluate(() => {
       const html = document.documentElement.innerHTML;
-      const jsonMatch = html.match(/"workspaceId"\s*:\s*"(wsp[a-zA-Z0-9]+)"/);
-      if (jsonMatch) return jsonMatch[1];
-      const anchors = Array.from(document.querySelectorAll('a'));
-      for (const a of anchors) {
-        const m = (a.href || '').match(/(wsp[a-zA-Z0-9]{10,})/);
-        if (m) return m[1];
-      }
-      const m = html.match(/wsp[a-zA-Z0-9]{10,}/);
-      return m ? m[0] : null;
+      // Find all wsp IDs, filter out the shared placeholder
+      const matches = html.match(/wsp[a-zA-Z0-9]{10,}/g) || [];
+      const real = matches.filter(m => m !== 'wspSHARED00000000');
+      return real.length > 0 ? real[0] : null;
     });
 
-    if (!wspId) {
-      console.log('[engine-session] No workspace ID on base page, trying home...');
-      await this.page.goto('https://airtable.com/', { waitUntil: 'networkidle', timeout: 30_000 });
-      await new Promise((r) => setTimeout(r, 3000));
-      wspId = await this.page.evaluate((bid: string) => {
-        const html = document.documentElement.innerHTML;
-        const idx = html.indexOf(bid);
-        if (idx === -1) return null;
-        const chunk = html.substring(Math.max(0, idx - 2000), Math.min(html.length, idx + 2000));
-        const m = chunk.match(/(wsp[a-zA-Z0-9]{10,})/);
-        return m ? m[1] : null;
-      }, baseId);
+    if (wspId) {
+      console.log(`[engine-session] Workspace ID from automations page: ${wspId}`);
+      return wspId;
     }
+
+    // Fallback: try the base page directly
+    console.log('[engine-session] No workspace ID on automations page, trying base page...');
+    await this.page.goto(`https://airtable.com/${baseId}`, {
+      waitUntil: 'networkidle',
+      timeout: 30_000,
+    });
+    await new Promise((r) => setTimeout(r, 5000));
+
+    wspId = await this.page.evaluate(() => {
+      const html = document.documentElement.innerHTML;
+      const matches = html.match(/wsp[a-zA-Z0-9]{10,}/g) || [];
+      const real = matches.filter(m => m !== 'wspSHARED00000000');
+      return real.length > 0 ? real[0] : null;
+    });
+
+    if (wspId) {
+      console.log(`[engine-session] Workspace ID from base page: ${wspId}`);
+      return wspId;
+    }
+
+    // Last resort: home page
+    console.log('[engine-session] Trying home page...');
+    await this.page.goto('https://airtable.com/', { waitUntil: 'networkidle', timeout: 30_000 });
+    await new Promise((r) => setTimeout(r, 3000));
+    wspId = await this.page.evaluate((bid: string) => {
+      const html = document.documentElement.innerHTML;
+      const idx = html.indexOf(bid);
+      if (idx === -1) return null;
+      const chunk = html.substring(Math.max(0, idx - 2000), Math.min(html.length, idx + 2000));
+      const m = chunk.match(/(wsp[a-zA-Z0-9]{10,})/);
+      return m ? m[1] : null;
+    }, baseId);
+
+    if (wspId) console.log(`[engine-session] Workspace ID from home page: ${wspId}`);
+    else console.log('[engine-session] Could not resolve workspace ID from any page');
 
     return wspId;
   }
