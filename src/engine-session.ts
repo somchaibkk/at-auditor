@@ -517,36 +517,54 @@ export class SessionEngine {
     });
     await new Promise((r) => setTimeout(r, 5000));
 
-    let wspId = await this.page.evaluate(() => {
+    let wspId = await this.page.evaluate((targetBaseId: string) => {
       const html = document.documentElement.innerHTML;
-      // Find all wsp IDs, filter out the shared placeholder
-      const matches = html.match(/wsp[a-zA-Z0-9]{10,}/g) || [];
-      const real = matches.filter(m => m !== 'wspSHARED00000000');
-      return real.length > 0 ? real[0] : null;
-    });
+
+      // Strategy 1: find workspaceId JSON key near the base's applicationId
+      // This is the most reliable as it finds the workspace specifically for this base
+      const baseIdx = html.indexOf(targetBaseId);
+      if (baseIdx !== -1) {
+        // Search in a window around the base ID for the associated workspace
+        const chunk = html.substring(Math.max(0, baseIdx - 3000), Math.min(html.length, baseIdx + 3000));
+        const wspMatch = chunk.match(/"workspaceId"\s*:\s*"(wsp[a-zA-Z0-9]+)"/);
+        if (wspMatch && wspMatch[1] !== 'wspSHARED00000000') {
+          return wspMatch[1];
+        }
+      }
+
+      // Strategy 2: look for workspaceId in JSON context (not just raw regex)
+      const jsonMatches = html.matchAll(/"workspaceId"\s*:\s*"(wsp[a-zA-Z0-9]+)"/g);
+      const candidates: string[] = [];
+      for (const m of jsonMatches) {
+        if (m[1] !== 'wspSHARED00000000') candidates.push(m[1]);
+      }
+      // If all JSON-based workspaceId values point to the same workspace, use it
+      const unique = [...new Set(candidates)];
+      if (unique.length === 1) return unique[0];
+
+      // Strategy 3: find the workspace ID that appears most often (likely the current one)
+      if (unique.length > 1) {
+        const counts: Record<string, number> = {};
+        for (const c of candidates) { counts[c] = (counts[c] || 0) + 1; }
+        const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+        return sorted[0][0];
+      }
+
+      // Strategy 4: brute force - find all wsp IDs, pick the most frequent non-SHARED one
+      const allMatches = html.match(/wsp[a-zA-Z0-9]{10,}/g) || [];
+      const real = allMatches.filter(m => m !== 'wspSHARED00000000');
+      if (real.length > 0) {
+        const freq: Record<string, number> = {};
+        for (const w of real) { freq[w] = (freq[w] || 0) + 1; }
+        const sorted = Object.entries(freq).sort((a, b) => b[1] - a[1]);
+        return sorted[0][0];
+      }
+
+      return null;
+    }, baseId);
 
     if (wspId) {
-      console.log(`[engine-session] Workspace ID from automations page: ${wspId}`);
-      return wspId;
-    }
-
-    // Fallback: try the base page directly
-    console.log('[engine-session] No workspace ID on automations page, trying base page...');
-    await this.page.goto(`https://airtable.com/${baseId}`, {
-      waitUntil: 'networkidle',
-      timeout: 30_000,
-    });
-    await new Promise((r) => setTimeout(r, 5000));
-
-    wspId = await this.page.evaluate(() => {
-      const html = document.documentElement.innerHTML;
-      const matches = html.match(/wsp[a-zA-Z0-9]{10,}/g) || [];
-      const real = matches.filter(m => m !== 'wspSHARED00000000');
-      return real.length > 0 ? real[0] : null;
-    });
-
-    if (wspId) {
-      console.log(`[engine-session] Workspace ID from base page: ${wspId}`);
+      console.log(`[engine-session] Workspace ID resolved: ${wspId}`);
       return wspId;
     }
 
@@ -560,7 +578,7 @@ export class SessionEngine {
       if (idx === -1) return null;
       const chunk = html.substring(Math.max(0, idx - 2000), Math.min(html.length, idx + 2000));
       const m = chunk.match(/(wsp[a-zA-Z0-9]{10,})/);
-      return m ? m[1] : null;
+      return m && m[1] !== 'wspSHARED00000000' ? m[1] : null;
     }, baseId);
 
     if (wspId) console.log(`[engine-session] Workspace ID from home page: ${wspId}`);
