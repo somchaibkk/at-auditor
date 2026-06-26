@@ -102,8 +102,8 @@ export function startServer(port: number, profileDir: string) {
     json(res, 404, { error: 'Not found' });
   });
 
-  server.listen(port, '127.0.0.1', () => {
-    console.log(`[server] Worker HTTP server listening on http://127.0.0.1:${port}`);
+  server.listen(port, '0.0.0.0', () => {
+    console.log(`[server] Worker HTTP server listening on http://0.0.0.0:${port}`);
   });
 
   return server;

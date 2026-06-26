@@ -23,7 +23,7 @@ export interface AnalysisConfig {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function db(cfg: AnalysisConfig): SupabaseClient {
+function db(cfg: AnalysisConfig): ReturnType<typeof createClient> {
   return createClient(cfg.supabaseUrl, cfg.supabaseServiceRoleKey, {
     auth: { persistSession: false },
     db:   { schema: 'audit' },

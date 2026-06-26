@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  at-auditor:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: at-auditor
+    restart: unless-stopped
+    ports:
+      - "3456:3456"
+      - "6080:6080"
+    volumes:
+      - browser-profile:/data/browser-profile
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+volumes:
+  browser-profile:

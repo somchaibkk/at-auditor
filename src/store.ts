@@ -9,7 +9,7 @@ import type { WorkerConfig } from './config.js';
 import type { CollectedAutomation } from './engine-session.js';
 
 export class Store {
-  private db: SupabaseClient;
+  private db: ReturnType<typeof createClient>;
 
   constructor(private cfg: WorkerConfig) {
     this.db = createClient(cfg.supabaseUrl, cfg.supabaseServiceRoleKey, {
