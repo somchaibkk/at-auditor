@@ -59,6 +59,28 @@ async function fetchPat(db: any, vaultSecretId: string): Promise<string> {
   return data as string;
 }
 
+async function notifyAuditComplete(baseConfig: ReturnType<typeof loadBaseConfig>, auditId: string) {
+  try {
+    const url = `${baseConfig.supabaseUrl}/functions/v1/audit-notify`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${baseConfig.supabaseServiceRoleKey}`,
+      },
+      body: JSON.stringify({ audit_id: auditId }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error('[worker] audit-notify failed:', res.status, body);
+    } else {
+      console.log('[worker] audit-notify:', JSON.stringify(body));
+    }
+  } catch (e) {
+    console.error('[worker] audit-notify error:', e instanceof Error ? e.message : e);
+  }
+}
+
 async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig>) {
   const cfg = {
     supabaseUrl:            baseConfig.supabaseUrl,
@@ -154,11 +176,17 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
     await store.setAuditStatus('complete');
     await store.event('analyse', 'Analysis complete');
     console.log('[worker] Audit complete');
+
+    // Send email notification
+    await notifyAuditComplete(baseConfig, audit.id);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error('[worker] Audit failed:', msg);
     await store.event('discover', `Worker failed: ${msg}`, 'error');
     await store.setAuditStatus('failed', msg);
+
+    // Send email notification on failure too
+    await notifyAuditComplete(baseConfig, audit.id);
   }
 }
 
