@@ -99,6 +99,11 @@ export class SessionEngine {
   private context!: BrowserContext;
   private page!:    Page;
 
+  // Cache workspace resolution results to avoid redundant navigation
+  private workspaceCache: Map<string, string> = new Map(); // baseId -> wspId
+  private wspSettingsCache: Map<string, any> = new Map();  // wspId -> workspaceSettings data
+  private collaboratorCache: Map<string, CollaboratorsResult> = new Map(); // wspId -> result
+
   /**
    * Start using a persistent browser profile.
    * If the profile is already logged in, continues immediately.
@@ -169,7 +174,7 @@ export class SessionEngine {
     };
 
     try {
-      // Step 1: resolve workspace ID (navigates to base page internally)
+      // Step 1: resolve workspace ID (uses cache after first call)
       console.log(`[engine-session] Resolving workspace for base ${baseId}...`);
       const wspId = await this.resolveWorkspaceId(baseId);
 
@@ -178,7 +183,15 @@ export class SessionEngine {
         return result;
       }
       result.workspaceId = wspId;
-      console.log(`[engine-session] Resolved workspace: ${result.workspaceId}`);
+
+      // Step 2: check collaborator cache (same workspace = same collaborators)
+      if (this.collaboratorCache.has(wspId)) {
+        console.log(`[engine-session] Using cached collaborators for workspace ${wspId}`);
+        const cached = this.collaboratorCache.get(wspId)!;
+        return { ...cached };
+      }
+
+      console.log(`[engine-session] Fetching workspaceSettings for ${wspId}...`);
 
       // Step 3: call the internal workspaceSettings API via page.evaluate
       const wsData = await this.fetchInternalApi(`/v0.3/${wspId}/workspace/workspaceSettings`);
@@ -232,6 +245,10 @@ export class SessionEngine {
 
       console.log(`[engine-session] Found ${result.collaborators.length} collaborator(s) via workspaceSettings API`);
       console.log(`[engine-session] Workspace: "${result.workspaceName}", Plan: ${(result as any).workspacePlan}`);
+
+      // Cache for subsequent bases in the same workspace
+      this.wspSettingsCache.set(wspId, wsData);
+      this.collaboratorCache.set(wspId, { ...result });
     } catch (err: any) {
       result.error = `Collaborator collection failed: ${err.message}`;
       console.error(`[engine-session] ${result.error}`);
@@ -269,8 +286,14 @@ export class SessionEngine {
       if (wspId) {
         console.log(`[engine-session] Tier 1: fetching workspace data for ${wspId}...`);
 
-        // workspaceSettings (full response, not just collaborator breakdown)
-        const wsSettings = await this.fetchInternalApi(`/v0.3/${wspId}/workspace/workspaceSettings`);
+        // workspaceSettings (use cache if available)
+        let wsSettings = this.wspSettingsCache.get(wspId) || null;
+        if (!wsSettings) {
+          wsSettings = await this.fetchInternalApi(`/v0.3/${wspId}/workspace/workspaceSettings`);
+          if (wsSettings) this.wspSettingsCache.set(wspId, wsSettings);
+        } else {
+          console.log(`[engine-session] Tier 1: using cached workspaceSettings`);
+        }
         if (wsSettings) {
           env.workspace = {
             workspaceId:   wspId,
@@ -510,6 +533,16 @@ export class SessionEngine {
 
   /** Resolve workspace ID from the current page's HTML */
   private async resolveWorkspaceId(baseId: string): Promise<string | null> {
+    // Return cached result immediately -- no navigation needed
+    if (this.workspaceCache.has(baseId)) {
+      const cached = this.workspaceCache.get(baseId)!;
+      console.log(`[engine-session] Workspace ID from cache: ${cached}`);
+      return cached;
+    }
+
+    // Also check if any cached workspace already knows this base
+    // (won't happen here but defensive)
+
     // Navigate to the automations page (known to fully bootstrap the app shell)
     await this.page.goto(`https://airtable.com/${baseId}/automations`, {
       waitUntil: 'networkidle',
@@ -517,36 +550,55 @@ export class SessionEngine {
     });
     await new Promise((r) => setTimeout(r, 5000));
 
-    let wspId = await this.page.evaluate(() => {
+    let wspId = await this.page.evaluate((targetBaseId: string) => {
       const html = document.documentElement.innerHTML;
-      // Find all wsp IDs, filter out the shared placeholder
-      const matches = html.match(/wsp[a-zA-Z0-9]{10,}/g) || [];
-      const real = matches.filter(m => m !== 'wspSHARED00000000');
-      return real.length > 0 ? real[0] : null;
-    });
+
+      // Strategy 1: find workspaceId JSON key near the base's applicationId
+      // This is the most reliable as it finds the workspace specifically for this base
+      const baseIdx = html.indexOf(targetBaseId);
+      if (baseIdx !== -1) {
+        // Search in a window around the base ID for the associated workspace
+        const chunk = html.substring(Math.max(0, baseIdx - 3000), Math.min(html.length, baseIdx + 3000));
+        const wspMatch = chunk.match(/"workspaceId"\s*:\s*"(wsp[a-zA-Z0-9]+)"/);
+        if (wspMatch && wspMatch[1] !== 'wspSHARED00000000') {
+          return wspMatch[1];
+        }
+      }
+
+      // Strategy 2: look for workspaceId in JSON context (not just raw regex)
+      const jsonMatches = html.matchAll(/"workspaceId"\s*:\s*"(wsp[a-zA-Z0-9]+)"/g);
+      const candidates: string[] = [];
+      for (const m of jsonMatches) {
+        if (m[1] !== 'wspSHARED00000000') candidates.push(m[1]);
+      }
+      // If all JSON-based workspaceId values point to the same workspace, use it
+      const unique = [...new Set(candidates)];
+      if (unique.length === 1) return unique[0];
+
+      // Strategy 3: find the workspace ID that appears most often (likely the current one)
+      if (unique.length > 1) {
+        const counts: Record<string, number> = {};
+        for (const c of candidates) { counts[c] = (counts[c] || 0) + 1; }
+        const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+        return sorted[0][0];
+      }
+
+      // Strategy 4: brute force - find all wsp IDs, pick the most frequent non-SHARED one
+      const allMatches = html.match(/wsp[a-zA-Z0-9]{10,}/g) || [];
+      const real = allMatches.filter(m => m !== 'wspSHARED00000000');
+      if (real.length > 0) {
+        const freq: Record<string, number> = {};
+        for (const w of real) { freq[w] = (freq[w] || 0) + 1; }
+        const sorted = Object.entries(freq).sort((a, b) => b[1] - a[1]);
+        return sorted[0][0];
+      }
+
+      return null;
+    }, baseId);
 
     if (wspId) {
-      console.log(`[engine-session] Workspace ID from automations page: ${wspId}`);
-      return wspId;
-    }
-
-    // Fallback: try the base page directly
-    console.log('[engine-session] No workspace ID on automations page, trying base page...');
-    await this.page.goto(`https://airtable.com/${baseId}`, {
-      waitUntil: 'networkidle',
-      timeout: 30_000,
-    });
-    await new Promise((r) => setTimeout(r, 5000));
-
-    wspId = await this.page.evaluate(() => {
-      const html = document.documentElement.innerHTML;
-      const matches = html.match(/wsp[a-zA-Z0-9]{10,}/g) || [];
-      const real = matches.filter(m => m !== 'wspSHARED00000000');
-      return real.length > 0 ? real[0] : null;
-    });
-
-    if (wspId) {
-      console.log(`[engine-session] Workspace ID from base page: ${wspId}`);
+      console.log(`[engine-session] Workspace ID resolved: ${wspId}`);
+      this.workspaceCache.set(baseId, wspId);
       return wspId;
     }
 
@@ -560,17 +612,21 @@ export class SessionEngine {
       if (idx === -1) return null;
       const chunk = html.substring(Math.max(0, idx - 2000), Math.min(html.length, idx + 2000));
       const m = chunk.match(/(wsp[a-zA-Z0-9]{10,})/);
-      return m ? m[1] : null;
+      return m && m[1] !== 'wspSHARED00000000' ? m[1] : null;
     }, baseId);
 
-    if (wspId) console.log(`[engine-session] Workspace ID from home page: ${wspId}`);
-    else console.log('[engine-session] Could not resolve workspace ID from any page');
-
+    if (wspId) {
+      console.log(`[engine-session] Workspace ID from home page: ${wspId}`);
+      this.workspaceCache.set(baseId, wspId);
+    } else {
+      console.log('[engine-session] Could not resolve workspace ID from any page');
+    }
     return wspId;
   }
 
   /** Generic internal API fetcher via page.evaluate (same-origin, session cookies) */
   private async fetchInternalApi(path: string): Promise<any> {
+    console.log(`[engine-session] fetchInternalApi: ${path.substring(0, 80)}...`);
     const result = await this.page.evaluate(async (url: string) => {
       try {
         const res = await fetch(url, {
@@ -579,12 +635,19 @@ export class SessionEngine {
             'x-requested-with': 'XMLHttpRequest',
           },
         });
-        if (!res.ok) return null;
+        if (!res.ok) {
+          return { __error: true, status: res.status, statusText: res.statusText, url };
+        }
         return await res.json();
-      } catch {
-        return null;
+      } catch (e: any) {
+        return { __error: true, message: e.message, url };
       }
     }, path);
+
+    if (result?.__error) {
+      console.error(`[engine-session] fetchInternalApi FAILED: ${JSON.stringify(result)}`);
+      return null;
+    }
     return result;
   }
 
