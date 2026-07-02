@@ -33,6 +33,7 @@ export interface CollectedAutomation {
   deploymentStatus: string | null;
   triggerTypeId:    string | null;
   trigger:          string;
+  triggerConfig:    Record<string, any> | null;
   stepCount:        number;
   actionTypes:      string[];
   scriptSources:    ScriptSource[];
@@ -58,6 +59,13 @@ const TRIGGER_LABELS: Record<string, string> = {
   wttCONNECTIONINPT: 'connected app',
   wttBUTTONCLICKED0: 'button clicked',
   wttWEBHOOK00000:   'webhook',
+  wttRECORDINVIEW00: 'record enters view',
+  wttSHAREVIEWFRM0:  'shared view form submitted',
+  wttEXTERNALACTN0:  'external action',
+  wttMANUALTRIGGER:  'manual trigger',
+  wttRECORDDELETED0: 'record deleted',
+  wttCOMMENTADDED0:  'comment added',
+  wttAIGENERATED00:  'AI generated',
 };
 
 const ACTION_LABELS: Record<string, string> = {
@@ -74,6 +82,13 @@ const ACTION_LABELS: Record<string, string> = {
   wdtNWAY0000000000: 'condition (branch)',
   wdtFANOUT00000000: 'repeat for each',
   wdtREDUCER0000000: 'summarize',
+  watCONNECTIONOUTP: 'connected app action',
+  watUPDATERECORDS0: 'update records',
+  watSENDWEBHOOK000: 'send webhook',
+  watLEAVECOMMENT00: 'leave comment',
+  watGENERATEAI0000: 'AI generate',
+  watSENDTEAMS00000: 'send Teams message',
+  watSENDGOOGLECHAT: 'send Google Chat',
 };
 
 // ---------------------------------------------------------------------------
@@ -102,7 +117,6 @@ export class SessionEngine {
   // Cache workspace resolution results to avoid redundant navigation
   private workspaceCache: Map<string, string> = new Map(); // baseId -> wspId
   private wspSettingsCache: Map<string, any> = new Map();  // wspId -> workspaceSettings data
-  private collaboratorCache: Map<string, CollaboratorsResult> = new Map(); // wspId -> result
 
   /**
    * Start using a persistent browser profile.
@@ -184,23 +198,22 @@ export class SessionEngine {
       }
       result.workspaceId = wspId;
 
-      // Step 2: check collaborator cache (same workspace = same collaborators)
-      if (this.collaboratorCache.has(wspId)) {
-        console.log(`[engine-session] Using cached collaborators for workspace ${wspId}`);
-        const cached = this.collaboratorCache.get(wspId)!;
-        return { ...cached };
+      // Step 2: get workspace settings (fetch once, cache for reuse)
+      let wsData = this.wspSettingsCache.get(wspId) || null;
+      if (!wsData) {
+        console.log(`[engine-session] Fetching workspaceSettings for ${wspId}...`);
+        wsData = await this.fetchInternalApi(`/v0.3/${wspId}/workspace/workspaceSettings`);
+        if (wsData) this.wspSettingsCache.set(wspId, wsData);
+      } else {
+        console.log(`[engine-session] Using cached workspaceSettings for ${wspId}`);
       }
 
-      console.log(`[engine-session] Fetching workspaceSettings for ${wspId}...`);
-
-      // Step 3: call the internal workspaceSettings API via page.evaluate
-      const wsData = await this.fetchInternalApi(`/v0.3/${wspId}/workspace/workspaceSettings`);
       if (!wsData) {
         result.error = 'workspaceSettings API returned no data';
         return result;
       }
 
-      // Step 4: parse the response
+      // Step 3: parse collaborators with base-specific permission resolution
       result.workspaceName = wsData.workspaceData?.workspaceName || null;
 
       const breakdown = wsData.workspaceData?.billableUserBreakdown;
@@ -212,29 +225,47 @@ export class SessionEngine {
       const profiles: Record<string, { id: string; name: string; email: string }> =
         breakdown.billableUserProfileInfoById || {};
 
+      // Workspace-level permissions (same for all bases)
       const wsPerms: Record<string, string> = {};
       for (const wc of breakdown.workspaceCollaborators || []) {
         wsPerms[wc.userId] = wc.permissionLevel;
       }
 
-      const appPerms: Record<string, Array<{ applicationId: string; permissionLevel: string }>> = {};
+      // Base-level permissions - filter for THIS specific base
+      const basePerms: Record<string, string> = {};
       for (const ac of breakdown.applicationCollaborators || []) {
-        if (!appPerms[ac.userId]) appPerms[ac.userId] = [];
-        appPerms[ac.userId].push({ applicationId: ac.applicationId, permissionLevel: ac.permissionLevel });
+        if (ac.applicationId === baseId) {
+          basePerms[ac.userId] = ac.permissionLevel;
+        }
       }
 
       for (const [userId, profile] of Object.entries(profiles)) {
-        const wspPerm = wsPerms[userId] || null;
-        const baseAccess = (appPerms[userId] || [])
-          .filter((a) => a.applicationId === baseId)
-          .map((a) => a.permissionLevel);
+        const wspPerm  = wsPerms[userId] || null;
+        const basePerm = basePerms[userId] || null;
+
+        // Determine effective permission and source
+        let permissionLevel: string | null;
+        let source: 'workspace' | 'base';
+        if (basePerm) {
+          // Explicit base-level permission takes precedence
+          permissionLevel = basePerm;
+          source = 'base';
+        } else if (wspPerm) {
+          // Workspace-level permission inherited by all bases
+          permissionLevel = wspPerm;
+          source = 'workspace';
+        } else {
+          // User is billable but has no explicit workspace or base-level permission for this base
+          permissionLevel = null;
+          source = 'base';
+        }
 
         result.collaborators.push({
           userId,
           email:           profile.email,
           name:            profile.name,
-          permissionLevel: wspPerm || baseAccess[0] || null,
-          source:          wspPerm ? 'workspace' : 'base',
+          permissionLevel,
+          source,
         });
       }
 
@@ -243,12 +274,10 @@ export class SessionEngine {
       (result as any).totalBillable = breakdown.numTotalBillableCollaborators || 0;
       (result as any).totalNonBillable = breakdown.numTotalNonBillableCollaborators || 0;
 
-      console.log(`[engine-session] Found ${result.collaborators.length} collaborator(s) via workspaceSettings API`);
+      const nullCount = result.collaborators.filter(c => !c.permissionLevel).length;
+      console.log(`[engine-session] Found ${result.collaborators.length} collaborator(s) for base ${baseId} (${nullCount} with unknown permission)`);
       console.log(`[engine-session] Workspace: "${result.workspaceName}", Plan: ${(result as any).workspacePlan}`);
 
-      // Cache for subsequent bases in the same workspace
-      this.wspSettingsCache.set(wspId, wsData);
-      this.collaboratorCache.set(wspId, { ...result });
     } catch (err: any) {
       result.error = `Collaborator collection failed: ${err.message}`;
       console.error(`[engine-session] ${result.error}`);
@@ -401,6 +430,86 @@ export class SessionEngine {
     }
   }
 
+  /**
+   * Collect workspaceUsageStats for ALL unique workspaces across audit bases.
+   * Call after the per-base loop so workspaceCache is warm.
+   * Returns { byWorkspace: { [wspId]: stats }, byBase: { [baseId]: stats }, errors: string[] }
+   */
+  async collectAllUsageStats(baseIds: string[]): Promise<Record<string, any>> {
+    const result: Record<string, any> = {
+      byWorkspace: {} as Record<string, any>,
+      byBase:      {} as Record<string, any>,
+      errors:      [] as string[],
+    };
+
+    // Resolve all bases to workspace IDs (using cache)
+    const wspToBasesMap = new Map<string, string[]>();
+    for (const baseId of baseIds) {
+      const wspId = await this.resolveWorkspaceId(baseId);
+      if (wspId) {
+        const existing = wspToBasesMap.get(wspId) || [];
+        existing.push(baseId);
+        wspToBasesMap.set(wspId, existing);
+      } else {
+        result.errors.push(`Could not resolve workspace for base ${baseId}`);
+      }
+    }
+
+    console.log(`[engine-session] Usage stats: ${wspToBasesMap.size} unique workspace(s) across ${baseIds.length} base(s)`);
+
+    for (const [wspId, bases] of wspToBasesMap) {
+      try {
+        const usageStats = await this.fetchInternalApi(`/v0.3/${wspId}/workspace/workspaceUsageStats`);
+        if (!usageStats) {
+          result.errors.push(`workspaceUsageStats failed for workspace ${wspId}`);
+          continue;
+        }
+
+        const statsData = usageStats.workspaceUsageStats || usageStats;
+        result.byWorkspace[wspId] = statsData;
+
+        // Log shape on first successful response for future reference
+        if (Object.keys(result.byWorkspace).length === 1) {
+          console.log(`[engine-session] workspaceUsageStats response keys: ${JSON.stringify(Object.keys(statsData))}`);
+          // If there's per-base data, log those keys too
+          if (statsData.baseUsageByBaseId) {
+            const firstBaseKey = Object.keys(statsData.baseUsageByBaseId)[0];
+            if (firstBaseKey) {
+              console.log(`[engine-session] Per-base usage keys: ${JSON.stringify(Object.keys(statsData.baseUsageByBaseId[firstBaseKey]))}`);
+            }
+          } else if (statsData.applicationUsageByApplicationId) {
+            const firstAppKey = Object.keys(statsData.applicationUsageByApplicationId)[0];
+            if (firstAppKey) {
+              console.log(`[engine-session] Per-app usage keys: ${JSON.stringify(Object.keys(statsData.applicationUsageByApplicationId[firstAppKey]))}`);
+            }
+          }
+        }
+
+        // Try to extract per-base data (field name might be baseUsageByBaseId or applicationUsageByApplicationId)
+        const perBase = statsData.baseUsageByBaseId
+          || statsData.applicationUsageByApplicationId
+          || null;
+
+        if (perBase && typeof perBase === 'object') {
+          for (const baseId of bases) {
+            const baseStats = perBase[baseId] || null;
+            if (baseStats) {
+              result.byBase[baseId] = baseStats;
+            }
+          }
+        }
+
+        console.log(`[engine-session] Usage stats OK for workspace ${wspId} (${bases.length} bases)`);
+      } catch (err: any) {
+        result.errors.push(`workspaceUsageStats error for ${wspId}: ${err.message}`);
+      }
+    }
+
+    const coveredBases = Object.keys(result.byBase).length;
+    console.log(`[engine-session] Usage stats: ${coveredBases}/${baseIds.length} bases have per-base data`);
+    return result;
+  }
+
   // ---------------------------------------------------------------------------
   // Private: enterprise data collection
   // ---------------------------------------------------------------------------
@@ -417,28 +526,46 @@ export class SessionEngine {
       errors:              [] as string[],
     };
 
-    // getUsersWithSearch (paginated, get all active users)
+    // Pre-flight: getUsersWithSearch (first page only to test admin access)
+    let hasAdminAccess = false;
     try {
-      const allUsers: any[] = [];
-      let offset = 0;
+      const params = JSON.stringify({ includeDescendantEnterpriseAccounts: false, filters: { state: 'active' }, offset: 0, limit: 50 });
+      const data = await this.fetchInternalApi(
+        `/v0.3/enterpriseAccount/${entId}/getUsersWithSearch?stringifiedObjectParams=${encodeURIComponent(params)}`,
+      );
+      const firstPageUsers = data?.data?.userAccounts || [];
+      const aggregateCount = data?.data?.aggregateUserLicenseCount ?? 0;
+
+      if (!data || (!firstPageUsers.length && !aggregateCount)) {
+        // API returned empty/zero data - session lacks enterprise admin scope
+        ent.noAdminAccess = true;
+        ent.errors.push('Enterprise admin pre-flight failed: getUsersWithSearch returned no users and no aggregates. The session credential does not have enterprise admin scope. All enterprise data will be empty/zero.');
+        console.log(`[engine-session] Enterprise pre-flight FAILED: no admin access, skipping remaining enterprise calls`);
+        return ent;
+      }
+
+      // Pre-flight passed - collect all users
+      hasAdminAccess = true;
+      const allUsers: any[] = [...firstPageUsers];
+      if (data?.data) {
+        ent.userAggregates = {
+          totalBasicUsersCount: data.data.totalBasicUsersCount,
+          aggregateUserLicenseCount: data.data.aggregateUserLicenseCount,
+          enterpriseAccountBillingModelType: data.data.enterpriseAccountBillingModelType,
+          enterpriseAccountEmailDomainInfos: data.data.enterpriseAccountEmailDomainInfos,
+        };
+      }
+      // Paginate remaining pages
+      let offset = 50;
       const limit = 50;
-      let hasMore = true;
+      let hasMore = firstPageUsers.length === limit;
       while (hasMore) {
-        const params = JSON.stringify({ includeDescendantEnterpriseAccounts: false, filters: { state: 'active' }, offset, limit });
-        const data = await this.fetchInternalApi(
-          `/v0.3/enterpriseAccount/${entId}/getUsersWithSearch?stringifiedObjectParams=${encodeURIComponent(params)}`,
+        const pageParams = JSON.stringify({ includeDescendantEnterpriseAccounts: false, filters: { state: 'active' }, offset, limit });
+        const pageData = await this.fetchInternalApi(
+          `/v0.3/enterpriseAccount/${entId}/getUsersWithSearch?stringifiedObjectParams=${encodeURIComponent(pageParams)}`,
         );
-        const users = data?.data?.userAccounts || [];
+        const users = pageData?.data?.userAccounts || [];
         allUsers.push(...users);
-        // Also capture aggregate data from first page
-        if (offset === 0 && data?.data) {
-          ent.userAggregates = {
-            totalBasicUsersCount: data.data.totalBasicUsersCount,
-            aggregateUserLicenseCount: data.data.aggregateUserLicenseCount,
-            enterpriseAccountBillingModelType: data.data.enterpriseAccountBillingModelType,
-            enterpriseAccountEmailDomainInfos: data.data.enterpriseAccountEmailDomainInfos,
-          };
-        }
         hasMore = users.length === limit;
         offset += limit;
       }
@@ -446,6 +573,9 @@ export class SessionEngine {
       console.log(`[engine-session] Enterprise users: ${allUsers.length}`);
     } catch (err: any) {
       ent.errors.push(`getUsersWithSearch: ${err.message}`);
+      ent.noAdminAccess = true;
+      console.log(`[engine-session] Enterprise pre-flight FAILED with error, skipping remaining enterprise calls`);
+      return ent;
     }
 
     // getEnterpriseSettings
@@ -749,6 +879,7 @@ export class SessionEngine {
       deploymentStatus: wf.deploymentStatus ?? null,
       triggerTypeId,
       trigger:          this.triggerLabel(triggerTypeId),
+      triggerConfig:    this.extractTriggerConfig(wf.trigger),
       stepCount:        allNodes.length,
       actionTypes,
       scriptSources:    [],
@@ -830,6 +961,28 @@ export class SessionEngine {
 
   triggerLabel(typeId: string | null): string {
     return typeId ? (TRIGGER_LABELS[typeId] ?? typeId) : 'unknown';
+  }
+
+  /** Extract useful config from the trigger object (connection name, table, schedule, etc.) */
+  private extractTriggerConfig(trigger: any): Record<string, any> | null {
+    if (!trigger) return null;
+    const cfg: Record<string, any> = {};
+    // Connection/app info (for connected app triggers and actions)
+    if (trigger.connectionId)   cfg.connectionId   = trigger.connectionId;
+    if (trigger.connectionName) cfg.connectionName  = trigger.connectionName;
+    if (trigger.appName)        cfg.appName         = trigger.appName;
+    // Table reference
+    if (trigger.tableId)        cfg.tableId         = trigger.tableId;
+    // Cron/schedule
+    if (trigger.cronExpression) cfg.cronExpression  = trigger.cronExpression;
+    if (trigger.timezone)       cfg.timezone        = trigger.timezone;
+    // Webhook
+    if (trigger.webhookUrl)     cfg.webhookUrl      = trigger.webhookUrl;
+    // Capture any inputExpressions keys (field names used in trigger config)
+    if (trigger.inputExpressions && typeof trigger.inputExpressions === 'object') {
+      cfg.inputExpressionKeys = Object.keys(trigger.inputExpressions);
+    }
+    return Object.keys(cfg).length > 0 ? cfg : null;
   }
 
   actionLabel(typeId: string): string {

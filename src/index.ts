@@ -175,10 +175,24 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
         await store.upsertBaseStatus(baseId, 'schema_done');
 
         if (audit.config?.include_record_samples !== false) {
-          await store.event('records', `Sampling up to ${cfg.recordSampleSize}/table across ${tableCount} table(s)`);
+          const keepCellValues = audit.config?.include_cell_values === true;
+          await store.event('records', `Sampling up to ${cfg.recordSampleSize}/table across ${tableCount} table(s)${keepCellValues ? ' (with cell values)' : ' (metadata only)'}`);
           for (const t of tables) {
             const { sample, sampledCount, hasMore } = await patEngine.sampleTable(baseId, t.id, cfg.recordSampleSize);
-            await store.saveRecordSample(baseId, t.id, t.name, sample, sampledCount, hasMore);
+            const storedSample = keepCellValues
+              ? sample
+              : sample.map((r: any) => ({
+                  id:      r.id,
+                  createdTime: r.createdTime,
+                  // Store field names and value types but not actual values
+                  fieldSummary: Object.fromEntries(
+                    Object.entries(r.fields || {}).map(([k, v]) => [
+                      k,
+                      { type: Array.isArray(v) ? 'array' : typeof v, empty: v === null || v === '' || v === undefined },
+                    ]),
+                  ),
+                }));
+            await store.saveRecordSample(baseId, t.id, t.name, storedSample, sampledCount, hasMore);
           }
           await store.upsertBaseStatus(baseId, 'records_done');
         }
@@ -209,6 +223,25 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
         const msg = e instanceof Error ? e.message : String(e);
         await store.event('schema', `Base ${baseId} failed: ${msg}`, 'error');
         await store.upsertBaseStatus(baseId, 'failed', msg);
+      }
+    }
+
+    // --- Usage stats collection (all workspaces, after workspace cache is warm) ---
+    if (wantEnv || audit.config?.collect_collaborators) {
+      try {
+        await store.event('usage', 'Collecting usage stats for all workspaces...');
+        const allBaseIds = targets.map(t => t.baseId);
+        const usageData = await session.collectAllUsageStats(allBaseIds);
+        const coveredBases = Object.keys(usageData.byBase).length;
+        const totalWorkspaces = Object.keys(usageData.byWorkspace).length;
+        await store.event('usage', `Usage stats: ${totalWorkspaces} workspace(s), ${coveredBases}/${allBaseIds.length} bases with per-base data`);
+        if (usageData.errors.length > 0) {
+          await store.event('usage', `Usage warnings: ${usageData.errors.join('; ')}`, 'warn');
+        }
+        await store.saveUsageStats(usageData);
+        await store.event('usage', 'Usage stats saved');
+      } catch (e: any) {
+        await store.event('usage', `Usage stats collection failed: ${e.message}`, 'warn');
       }
     }
 

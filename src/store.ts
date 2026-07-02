@@ -99,6 +99,7 @@ export class Store {
         deployment_status: a.deploymentStatus,              // "deployed" | "undeployed" | null
         trigger_type_id:  a.triggerTypeId,
         trigger:          a.trigger,                        // human label
+        trigger_config:   a.triggerConfig,                  // connection/app/schedule details
         step_count:       a.stepCount,
         action_types:     a.actionTypes,                    // string[]
         script_sources:   a.scriptSources,                  // { actionId, stepIndex, actionType, lines, code }[]
@@ -153,6 +154,24 @@ export class Store {
     await this.db.from('base_schemas').update({
       automation_stats: stats,
     }).eq('audit_id', this.cfg.auditId).eq('base_id', baseId);
+  }
+
+  async saveUsageStats(usageData: Record<string, any>) {
+    // Merge usage stats into environment_data
+    const { data: existing } = await this.db
+      .from('environment_data')
+      .select('data')
+      .eq('audit_id', this.cfg.auditId)
+      .limit(1)
+      .maybeSingle();
+
+    const envData = existing?.data ?? {};
+    envData.allUsageStats = usageData;
+
+    await this.db.from('environment_data').upsert(
+      { audit_id: this.cfg.auditId, data: envData },
+      { onConflict: 'audit_id' },
+    );
   }
 
   // ---------------------------------------------------------------------------
