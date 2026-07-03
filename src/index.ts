@@ -96,8 +96,19 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
 
   try {
     await store.event('discover', 'Worker started');
-    if (!audit.vault_secret_id) throw new Error('No PAT stored for this audit');
-    const pat = await fetchPat(db, audit.vault_secret_id);
+
+    // Resolve PAT: audit-level first, then client-level fallback
+    let vaultSecretId = audit.vault_secret_id;
+    if (!vaultSecretId && audit.client_id) {
+      const { data: clientData } = await db
+        .from('clients')
+        .select('vault_secret_id')
+        .eq('id', audit.client_id)
+        .single();
+      vaultSecretId = clientData?.vault_secret_id ?? null;
+    }
+    if (!vaultSecretId) throw new Error('No PAT stored for this audit or its client');
+    const pat = await fetchPat(db, vaultSecretId);
 
     const limiter   = new RateLimiter(cfg.patRequestsPerSecond);
     const patEngine = new PatEngine(pat, limiter);
