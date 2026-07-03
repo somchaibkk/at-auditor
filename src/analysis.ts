@@ -235,7 +235,7 @@ export async function runAnalysis(cfg: AnalysisConfig): Promise<void> {
   // Environment-level findings
   // ---------------------------------------------------------------------------
 
-  if (envData?.enterprise?.noAdminAccess) {
+  if (envData?.enterprise?.noAdminAccess || envData?.enterprise?.errors?.some((e: string) => e.includes('pre-flight failed'))) {
     findings.push({
       audit_id:       cfg.auditId,
       severity:       'medium',
@@ -394,10 +394,10 @@ export async function runAnalysis(cfg: AnalysisConfig): Promise<void> {
           if (tgt) tgt.inbound++;
         }
 
-        // Hub tables (>= 6 total connections)
+        // Hub tables (>= 12 total connections)
         for (const [tableId, c] of connectivity) {
           const total = c.outbound + c.inbound;
-          if (total >= 6) {
+          if (total >= 12) {
             findings.push({
               audit_id:       cfg.auditId,
               severity:       'medium',
@@ -533,7 +533,7 @@ export async function runAnalysis(cfg: AnalysisConfig): Promise<void> {
         const nullPerms = collabs.filter((c: any) => !c.permissionLevel);
         const nullRate  = nullPerms.length / collabs.length;
 
-        if (nullPerms.length > 0 && nullRate > 0.3) {
+        if (nullPerms.length > 0 && nullRate > 0.5 && collabs.length > 30) {
           findings.push({
             audit_id:       cfg.auditId,
             severity:       'medium',

@@ -168,6 +168,17 @@ export class SessionEngine {
     await this.context?.close();
   }
 
+  /** Restart the browser to free memory. Clears page caches but keeps workspace/settings caches. */
+  async restartBrowser(profileDir: string): Promise<void> {
+    console.log('[engine-session] Restarting browser to free memory...');
+    try { await this.context?.close(); } catch (_) {}
+    // Small delay to let OS reclaim memory
+    await new Promise((r) => setTimeout(r, 2000));
+    this.context = await chromium.launchPersistentContext(profileDir, { headless: true });
+    this.page    = await this.context.newPage();
+    console.log('[engine-session] Browser restarted');
+  }
+
   // ---------------------------------------------------------------------------
   // Collaborator collection via internal API
   // ---------------------------------------------------------------------------
@@ -981,6 +992,22 @@ export class SessionEngine {
     // Capture any inputExpressions keys (field names used in trigger config)
     if (trigger.inputExpressions && typeof trigger.inputExpressions === 'object') {
       cfg.inputExpressionKeys = Object.keys(trigger.inputExpressions);
+    }
+    // If no specific keys matched, capture all top-level keys for discovery
+    if (Object.keys(cfg).length === 0) {
+      const topKeys = Object.keys(trigger).filter(k =>
+        k !== 'workflowTriggerTypeId' && trigger[k] !== null && trigger[k] !== undefined,
+      );
+      if (topKeys.length > 0) {
+        cfg._rawKeys = topKeys;
+        // Capture scalar values for discovery (skip large objects)
+        for (const k of topKeys) {
+          const v = trigger[k];
+          if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+            cfg[k] = v;
+          }
+        }
+      }
     }
     return Object.keys(cfg).length > 0 ? cfg : null;
   }

@@ -146,7 +146,21 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
       }
     }
 
+    let baseIndex = 0;
+    const RESTART_EVERY = 15; // Restart browser every N bases to prevent memory exhaustion
+
     for (const { baseId, baseName } of targets) {
+      // Periodic browser restart to prevent Chromium memory crashes
+      if (baseIndex > 0 && baseIndex % RESTART_EVERY === 0 && (audit.config?.collect_collaborators || wantEnv)) {
+        try {
+          await store.event('browser', `Restarting browser after ${baseIndex} bases to free memory`);
+          await session.restartBrowser(baseConfig.browserProfileDir);
+        } catch (e: any) {
+          await store.event('browser', `Browser restart failed: ${e.message}`, 'warn');
+        }
+      }
+      baseIndex++;
+
       try {
         await store.event('schema', `Schema: ${baseName ?? baseId}`);
         const { tables, tableCount, fieldCount } = await patEngine.getBaseSchema(baseId);
