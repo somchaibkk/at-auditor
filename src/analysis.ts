@@ -85,13 +85,20 @@ function scriptComplexity(code: string): 'low' | 'medium' | 'high' {
 
 const SENSITIVE_FIELD_NAMES = /\b(email|e-mail|phone|tel|mobile|ssn|social.security|national.id|passport|credit.card|card.number|iban|bank.account|salary|wage|compensation|dob|date.of.birth|birth.?date|address|zip.?code|postal|national.insurance|tax.id|vat.number|driver.license|licence|sin\b|nin\b|bsn\b|niss\b)/i;
 
-const PII_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
+const PII_PATTERNS: Array<{ name: string; pattern: RegExp; excludeFields?: RegExp }> = [
   { name: 'email',        pattern: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/  },
-  { name: 'phone',        pattern: /(?:\+\d{1,3}[\s-]?)?\(?\d{2,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{3,4}/ },
+  // Phone: require + prefix OR parenthesized area code OR explicit separators (not bare digit runs)
+  { name: 'phone',
+    pattern: /(?:\+\d{1,3}[\s-]\d[\d\s-]{6,14}|\(\d{2,4}\)\s?\d{3,4}[\s.-]\d{3,4}|\b\d{2,4}[\s-]\d{3,4}[\s-]\d{3,4}\b)/,
+    excludeFields: /barcode|upc|ean|sku|hts|hs.code|intrastat|cost|price|rrp|fx[_\s]|currency|image|img|photo|sketch|shareable|label|sticker|docket|bom|code|digit|check|start|number.*ex/i,
+  },
   { name: 'IBAN',         pattern: /[A-Z]{2}\d{2}[\s]?[A-Z0-9]{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}/ },
   { name: 'credit card',  pattern: /\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/ },
   { name: 'SSN',          pattern: /\b\d{3}-\d{2}-\d{4}\b/ },
-  { name: 'BE NISS',      pattern: /\b\d{2}[.\s]?\d{2}[.\s]?\d{2}[.\s-]?\d{3}[.\s-]?\d{2}\b/ },
+  { name: 'BE NISS',
+    pattern: /\b\d{2}[.\s]\d{2}[.\s]\d{2}[.\s-]\d{3}[.\s-]\d{2}\b/,
+    excludeFields: /barcode|upc|ean|sku|hts|hs.code|intrastat|cost|price|rrp|fx[_\s]|currency|code|digit/i,
+  },
 ];
 
 interface PiiHit {
@@ -113,7 +120,8 @@ function scanSampleForPii(tableName: string, records: any[]): PiiHit[] {
       const strValue = typeof value === 'string' ? value : JSON.stringify(value);
       if (!strValue || strValue.length < 3) continue;
 
-      for (const { name: piiType, pattern } of PII_PATTERNS) {
+      for (const { name: piiType, pattern, excludeFields } of PII_PATTERNS) {
+        if (excludeFields && excludeFields.test(fieldName)) continue;
         if (pattern.test(strValue)) {
           const key = `${tableName}.${fieldName}.${piiType}`;
           const existing = hits.get(key);

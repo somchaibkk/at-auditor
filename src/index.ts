@@ -254,6 +254,8 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
     // --- Usage stats collection (all workspaces, after workspace cache is warm) ---
     if (wantEnv || audit.config?.collect_collaborators) {
       try {
+        // Restart browser before usage stats to ensure it's alive
+        await session.restartBrowser(baseConfig.browserProfileDir);
         await store.event('usage', 'Collecting usage stats for all workspaces...');
         const allBaseIds = targets.map(t => t.baseId);
         const usageData = await session.collectAllUsageStats(allBaseIds);
