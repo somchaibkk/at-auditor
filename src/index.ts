@@ -284,6 +284,19 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
     await store.event('analyse', 'Analysis complete');
     console.log('[worker] Audit complete');
 
+    // Generate full JSON export and upload to storage
+    try {
+      await store.event('export', 'Generating full audit export...');
+      const exportUrl = await store.generateAndUploadExport();
+      if (exportUrl) {
+        await store.event('export', `Export uploaded: ${exportUrl}`);
+      } else {
+        await store.event('export', 'Export generation failed', 'warn');
+      }
+    } catch (e: any) {
+      await store.event('export', `Export failed: ${e.message}`, 'warn');
+    }
+
     // Send email notification
     await notifyAuditComplete(baseConfig, audit.id);
   } catch (e) {
