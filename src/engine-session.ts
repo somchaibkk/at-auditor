@@ -124,14 +124,14 @@ export class SessionEngine {
    * If not, opens headful and waits for the operator to log in (up to 5 min).
    */
   async start(profileDir: string, headless = false): Promise<void> {
-    this.context = await chromium.launchPersistentContext(profileDir, { headless: false, chromiumSandbox: false });
+    this.context = await chromium.launchPersistentContext(profileDir, { headless: false, chromiumSandbox: false, args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] });
     this.page = await this.context.newPage();
     await this.page.goto('https://airtable.com/login', { waitUntil: 'domcontentloaded' });
     await this.ensureLoggedIn();
     // If headless was requested and we're already logged in, relaunch headless
     if (headless) {
       await this.context.close();
-      this.context = await chromium.launchPersistentContext(profileDir, { headless: true, chromiumSandbox: false });
+      this.context = await chromium.launchPersistentContext(profileDir, { headless: true, chromiumSandbox: false, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
       this.page = await this.context.newPage();
     }
   }
@@ -160,7 +160,7 @@ export class SessionEngine {
 
   // Start headless using an already-logged-in persistent profile (no login wait)
   async startHeadless(profileDir: string): Promise<void> {
-    this.context = await chromium.launchPersistentContext(profileDir, { headless: true, chromiumSandbox: false });
+    this.context = await chromium.launchPersistentContext(profileDir, { headless: true, chromiumSandbox: false, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
     this.page    = await this.context.newPage();
   }
 
@@ -174,7 +174,7 @@ export class SessionEngine {
     try { await this.context?.close(); } catch (_) {}
     // Small delay to let OS reclaim memory
     await new Promise((r) => setTimeout(r, 2000));
-    this.context = await chromium.launchPersistentContext(profileDir, { headless: true, chromiumSandbox: false });
+    this.context = await chromium.launchPersistentContext(profileDir, { headless: true, chromiumSandbox: false, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
     this.page    = await this.context.newPage();
     console.log('[engine-session] Browser restarted');
   }

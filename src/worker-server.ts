@@ -54,7 +54,7 @@ async function handleLogin(req: IncomingMessage, res: ServerResponse) {
   _status = 'busy';
 
   try {
-    const context = await chromium.launchPersistentContext(profileDir, { headless: false });
+    const context = await chromium.launchPersistentContext(profileDir, { headless: false, chromiumSandbox: false, args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] });
     const page = await context.newPage();
     await page.goto('https://airtable.com/login', { waitUntil: 'domcontentloaded' });
 
