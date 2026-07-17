@@ -11,7 +11,7 @@ services:
       - "3456:3456"
       - "6080:6080"
     volumes:
-      - browser-profile:/data/browser-profile
+      - browser-profiles:/data/browser-profiles
     environment:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
@@ -21,4 +21,4 @@ services:
           memory: 2G
 
 volumes:
-  browser-profile:
+  browser-profiles:

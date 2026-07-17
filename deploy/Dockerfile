@@ -42,7 +42,7 @@ COPY tsconfig.json ./
 COPY src/ ./src/
 RUN npm run build
 
-RUN mkdir -p /data/browser-profile /var/log/supervisor
+RUN mkdir -p /data/browser-profiles /var/log/supervisor
 
 COPY deploy/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
