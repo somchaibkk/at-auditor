@@ -29,16 +29,32 @@ function json(res: ServerResponse, status: number, body: unknown) {
   res.end(data);
 }
 
-async function handleLogin(res: ServerResponse) {
+async function handleLogin(req: IncomingMessage, res: ServerResponse) {
   if (_status === 'busy') {
     return json(res, 409, { error: 'Worker is busy running an audit' });
   }
 
-  console.log('[server] Opening browser for login...');
+  // Read optional client_id from request body
+  let clientId = '';
+  try {
+    const body = await new Promise<string>((resolve) => {
+      let data = '';
+      req.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+      req.on('end', () => resolve(data));
+    });
+    if (body) {
+      const parsed = JSON.parse(body);
+      clientId = typeof parsed.client_id === 'string' ? parsed.client_id : '';
+    }
+  } catch (_) {}
+
+  const profileDir = clientId ? `${_profileDir}/${clientId}` : _profileDir;
+
+  console.log(`[server] Opening browser for login (profile: ${profileDir})...`);
   _status = 'busy';
 
   try {
-    const context = await chromium.launchPersistentContext(_profileDir, { headless: false });
+    const context = await chromium.launchPersistentContext(profileDir, { headless: false });
     const page = await context.newPage();
     await page.goto('https://airtable.com/login', { waitUntil: 'domcontentloaded' });
 
@@ -60,9 +76,9 @@ async function handleLogin(res: ServerResponse) {
     }
 
     await context.close();
-    _status = 'logged_in';
-    console.log('[server] Browser closed. Status: logged_in');
-    json(res, 200, { ok: true, status: 'logged_in' });
+    _status = 'idle';
+    console.log(`[server] Browser closed. Profile saved for ${clientId || 'default'}`);
+    json(res, 200, { ok: true, status: 'idle', client_id: clientId || null });
   } catch (e: any) {
     _status = 'idle';
     json(res, 500, { error: e.message });
@@ -95,7 +111,7 @@ export function startServer(port: number, profileDir: string) {
     }
 
     if (req.method === 'POST' && url === '/login') {
-      handleLogin(res);
+      handleLogin(req, res);
       return;
     }
 

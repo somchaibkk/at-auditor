@@ -1,6 +1,8 @@
 // index.ts
 // Worker entry point. Starts HTTP server + polls for queued audits.
 
+import fs   from 'fs';
+import path from 'path';
 import { RateLimiter }   from './rate-limiter.js';
 import { PatEngine }     from './engine-pat.js';
 import { SessionEngine } from './engine-session.js';
@@ -81,6 +83,13 @@ async function notifyAuditComplete(baseConfig: ReturnType<typeof loadBaseConfig>
   }
 }
 
+/** True when a client profile directory is empty or missing (needs VNC login). */
+function isProfileFresh(profileDir: string): boolean {
+  if (!fs.existsSync(profileDir)) return true;
+  const entries = fs.readdirSync(profileDir);
+  return entries.length === 0;
+}
+
 async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig>) {
   const cfg = {
     supabaseUrl:            baseConfig.supabaseUrl,
@@ -117,8 +126,20 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
     const targets = await store.getTargetBases();
     await store.event('discover', `Collecting ${targets.length} base(s)`);
 
-    // Start session headless -- login was done separately via /login endpoint
-    await session.startHeadless(baseConfig.browserProfileDir);
+    // --- Per-client browser profile ---
+    const clientId = audit.client_id || audit.id;
+    const clientProfileDir = path.join(baseConfig.browserProfileDir, clientId);
+    fs.mkdirSync(clientProfileDir, { recursive: true });
+
+    if (isProfileFresh(clientProfileDir)) {
+      // Fresh profile: open headful browser on VNC for operator to log in
+      await store.event('browser', `No session for client ${audit.prospect_name || clientId}. Opening browser for VNC login...`);
+      console.log(`[worker] Fresh profile for ${clientId}. Opening headful browser for VNC login.`);
+      await session.start(clientProfileDir, true); // headful -> wait for login -> relaunch headless
+      await store.event('browser', 'Login confirmed, continuing headless');
+    } else {
+      await session.startHeadless(clientProfileDir);
+    }
 
     // --- Environment data collection (once per audit, not per base) ---
     const wantEnv        = audit.config?.collect_environment !== false && audit.config?.collect_collaborators;
@@ -165,7 +186,7 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
       if (baseIndex > 0 && baseIndex % RESTART_EVERY === 0 && (audit.config?.collect_collaborators || wantEnv)) {
         try {
           await store.event('browser', `Restarting browser after ${baseIndex} bases to free memory`);
-          await session.restartBrowser(baseConfig.browserProfileDir);
+          await session.restartBrowser(clientProfileDir);
         } catch (e: any) {
           await store.event('browser', `Browser restart failed: ${e.message}`, 'warn');
         }
@@ -255,7 +276,7 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
     if (wantEnv || audit.config?.collect_collaborators) {
       try {
         // Restart browser before usage stats to ensure it's alive
-        await session.restartBrowser(baseConfig.browserProfileDir);
+        await session.restartBrowser(clientProfileDir);
         await store.event('usage', 'Collecting usage stats for all workspaces...');
         const allBaseIds = targets.map(t => t.baseId);
         const usageData = await session.collectAllUsageStats(allBaseIds);
@@ -322,18 +343,18 @@ async function main() {
 
   // Start HTTP server
   startServer(SERVER_PORT, baseConfig.browserProfileDir);
-  console.log('[worker] Ready. Use the Login button in the UI, then Start Audit.');
+  console.log('[worker] Ready. Polling for queued audits (per-client browser profiles).');
 
   // Poll loop
   while (true) {
     const status = getStatus();
 
-    if (status === 'logged_in') {
+    if (status !== 'busy') {
       const audit = await claimNextAudit(db);
       if (audit) {
         setStatus('busy');
         await runAudit(audit, baseConfig);
-        setStatus('logged_in'); // keep logged_in so next audit can run without re-login
+        setStatus('idle');
       }
     }
 
