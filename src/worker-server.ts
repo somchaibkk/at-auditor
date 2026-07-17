@@ -10,7 +10,16 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'http';
 import { chromium } from 'playwright';
 
-export type WorkerStatus = 'idle' | 'logged_in' | 'busy';
+export type WorkerStatus = 'idle' | 'logged_in' | 'login_required' | 'busy';
+
+// Resolves when the operator confirms login
+let _loginConfirmResolve: (() => void) | null = null;
+
+export function waitForLoginConfirm(): Promise<void> {
+  return new Promise((resolve) => {
+    _loginConfirmResolve = resolve;
+  });
+}
 
 let _status: WorkerStatus = 'idle';
 let _profileDir: string = '';
@@ -112,6 +121,18 @@ export function startServer(port: number, profileDir: string) {
 
     if (req.method === 'POST' && url === '/login') {
       handleLogin(req, res);
+      return;
+    }
+
+    if (req.method === 'POST' && url === '/confirm-login') {
+      if (_loginConfirmResolve) {
+        _loginConfirmResolve();
+        _loginConfirmResolve = null;
+        _status = 'busy';
+        json(res, 200, { ok: true });
+      } else {
+        json(res, 400, { error: 'No login pending' });
+      }
       return;
     }
 

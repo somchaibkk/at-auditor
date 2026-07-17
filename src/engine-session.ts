@@ -158,6 +158,18 @@ export class SessionEngine {
   }
 
 
+  /** Open headful browser on VNC without waiting for login. Operator confirms via UI. */
+  async startHeadfulOnly(profileDir: string): Promise<void> {
+    this.context = await chromium.launchPersistentContext(profileDir, {
+      headless: false,
+      chromiumSandbox: false,
+      args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    });
+    this.page = await this.context.newPage();
+    await this.page.goto('https://airtable.com/login', { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+    console.log('[engine-session] Headful browser open on VNC, waiting for operator to log in...');
+  }
+
   // Start headless using an already-logged-in persistent profile (no login wait)
   async startHeadless(profileDir: string): Promise<void> {
     this.context = await chromium.launchPersistentContext(profileDir, { headless: true, chromiumSandbox: false, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
