@@ -7,7 +7,7 @@ import { RateLimiter }   from './rate-limiter.js';
 import { PatEngine }     from './engine-pat.js';
 import { SessionEngine } from './engine-session.js';
 import { Store }         from './store.js';
-import { startServer, setStatus, getStatus } from './worker-server.js';
+import { startServer, setStatus, getStatus, waitForLoginConfirm } from './worker-server.js';
 import { runAnalysis }   from './analysis.js';
 import { createClient }  from '@supabase/supabase-js';
 
@@ -132,11 +132,21 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
     fs.mkdirSync(clientProfileDir, { recursive: true });
 
     if (isProfileFresh(clientProfileDir)) {
-      // Fresh profile: open headful browser on VNC for operator to log in
-      await store.event('browser', `No session for client ${audit.prospect_name || clientId}. Opening browser for VNC login...`);
-      console.log(`[worker] Fresh profile for ${clientId}. Opening headful browser for VNC login.`);
-      await session.start(clientProfileDir, true); // headful -> wait for login -> relaunch headless
-      await store.event('browser', 'Login confirmed, continuing headless');
+      // Fresh profile: open headful browser on VNC, wait for operator to confirm login
+      await store.event('browser', `No session for client ${audit.prospect_name || clientId}. Log in via VNC then press Continue.`);
+      console.log(`[worker] Fresh profile for ${clientId}. Opening headful browser, waiting for login confirmation.`);
+      setStatus('login_required');
+      // Open headful browser (visible on VNC) - does NOT wait for login automatically
+      await session.startHeadfulOnly(clientProfileDir);
+      // Block until operator presses "Continue" in the UI
+      await waitForLoginConfirm();
+      await store.event('browser', 'Login confirmed. Relaunching headless...');
+      console.log(`[worker] Login confirmed for ${clientId}. Relaunching headless.`);
+      // Relaunch headless with the now-populated profile
+      await session.stop();
+      await session.startHeadless(clientProfileDir);
+      await store.event('browser', 'Browser ready, starting collection.');
+      setStatus('busy');
     } else {
       await session.startHeadless(clientProfileDir);
     }
