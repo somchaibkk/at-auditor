@@ -124,14 +124,14 @@ export class SessionEngine {
    * If not, opens headful and waits for the operator to log in (up to 5 min).
    */
   async start(profileDir: string, headless = false): Promise<void> {
-    this.context = await chromium.launchPersistentContext(profileDir, { headless: false });
+    this.context = await chromium.launchPersistentContext(profileDir, { headless: false, chromiumSandbox: false });
     this.page = await this.context.newPage();
     await this.page.goto('https://airtable.com/login', { waitUntil: 'domcontentloaded' });
     await this.ensureLoggedIn();
     // If headless was requested and we're already logged in, relaunch headless
     if (headless) {
       await this.context.close();
-      this.context = await chromium.launchPersistentContext(profileDir, { headless: true });
+      this.context = await chromium.launchPersistentContext(profileDir, { headless: true, chromiumSandbox: false });
       this.page = await this.context.newPage();
     }
   }
@@ -160,7 +160,7 @@ export class SessionEngine {
 
   // Start headless using an already-logged-in persistent profile (no login wait)
   async startHeadless(profileDir: string): Promise<void> {
-    this.context = await chromium.launchPersistentContext(profileDir, { headless: true });
+    this.context = await chromium.launchPersistentContext(profileDir, { headless: true, chromiumSandbox: false });
     this.page    = await this.context.newPage();
   }
 
@@ -174,7 +174,7 @@ export class SessionEngine {
     try { await this.context?.close(); } catch (_) {}
     // Small delay to let OS reclaim memory
     await new Promise((r) => setTimeout(r, 2000));
-    this.context = await chromium.launchPersistentContext(profileDir, { headless: true });
+    this.context = await chromium.launchPersistentContext(profileDir, { headless: true, chromiumSandbox: false });
     this.page    = await this.context.newPage();
     console.log('[engine-session] Browser restarted');
   }
@@ -529,16 +529,21 @@ export class SessionEngine {
     const ent: Record<string, any> = {
       enterpriseAccountId: entId,
       users:               null,
+      userDetails:         null,
+      userGroups:          null,
       enterpriseSettings:  null,
       licenseSummary:      null,
       roles:               null,
       pendingInvites:      null,
       workspaces:          null,
+      shadowWorkspaces:    null,
+      bases:               null,
+      interfaces:          null,
+      billing:             null,
       errors:              [] as string[],
     };
 
     // Pre-flight: getUsersWithSearch (first page only to test admin access)
-    let hasAdminAccess = false;
     try {
       const params = JSON.stringify({ includeDescendantEnterpriseAccounts: false, filters: { state: 'active' }, offset: 0, limit: 50 });
       const data = await this.fetchInternalApi(
@@ -548,25 +553,24 @@ export class SessionEngine {
       const aggregateCount = data?.data?.aggregateUserLicenseCount ?? 0;
 
       if (!data || (!firstPageUsers.length && !aggregateCount)) {
-        // API returned empty/zero data - session lacks enterprise admin scope
         ent.noAdminAccess = true;
-        ent.errors.push('Enterprise admin pre-flight failed: getUsersWithSearch returned no users and no aggregates. The session credential does not have enterprise admin scope. All enterprise data will be empty/zero.');
-        console.log(`[engine-session] Enterprise pre-flight FAILED: no admin access, skipping remaining enterprise calls`);
+        ent.errors.push('Enterprise admin pre-flight failed: no admin access.');
+        console.log(`[engine-session] Enterprise pre-flight FAILED: no admin access`);
         return ent;
       }
 
-      // Pre-flight passed - collect all users
-      hasAdminAccess = true;
-      const allUsers: any[] = [...firstPageUsers];
+      // Collect aggregates
       if (data?.data) {
         ent.userAggregates = {
-          totalBasicUsersCount: data.data.totalBasicUsersCount,
-          aggregateUserLicenseCount: data.data.aggregateUserLicenseCount,
-          enterpriseAccountBillingModelType: data.data.enterpriseAccountBillingModelType,
-          enterpriseAccountEmailDomainInfos: data.data.enterpriseAccountEmailDomainInfos,
+          totalBasicUsersCount:               data.data.totalBasicUsersCount,
+          aggregateUserLicenseCount:          data.data.aggregateUserLicenseCount,
+          enterpriseAccountBillingModelType:  data.data.enterpriseAccountBillingModelType,
+          enterpriseAccountEmailDomainInfos:  data.data.enterpriseAccountEmailDomainInfos,
         };
       }
-      // Paginate remaining pages
+
+      // Paginate all users
+      const allUsers: any[] = [...firstPageUsers];
       let offset = 50;
       const limit = 50;
       let hasMore = firstPageUsers.length === limit;
@@ -582,16 +586,53 @@ export class SessionEngine {
       }
       ent.users = allUsers;
       console.log(`[engine-session] Enterprise users: ${allUsers.length}`);
+
+      // getUserAccountDetails for every user (PATs, workspace access, API restriction)
+      console.log(`[engine-session] Fetching user account details for ${allUsers.length} users...`);
+      const userDetails: Record<string, any> = {};
+      for (const user of allUsers) {
+        const uid = user.id || user.userId;
+        if (!uid) continue;
+        try {
+          const detailParams = JSON.stringify({ userId: uid, shouldFetchPageBundles: true });
+          const detail = await this.fetchInternalApi(
+            `/v0.3/enterpriseAccount/${entId}/getUserAccountDetails?stringifiedObjectParams=${encodeURIComponent(detailParams)}`,
+          );
+          if (detail?.data) {
+            userDetails[uid] = {
+              workspaceInfos:        detail.data.workspaceInfos || [],
+              sharedApplicationInfos: detail.data.sharedApplicationInfos || [],
+              sharedPageBundleInfos:  detail.data.sharedPageBundleInfos || [],
+              userGroups:            detail.data.userGroups || [],
+              maximalUserApiScopes:  detail.data.maximalUserApiScopes || [],
+              isApiAccessDisabled:   detail.data.isApiAccessDisabledForUserDueToEnterpriseRestriction || false,
+              personalAccessTokens:  detail.data.personalAccessTokens || [],
+              oauthAccessTokens:     detail.data.oauthAccessTokens || [],
+            };
+          }
+        } catch (err: any) {
+          console.warn(`[engine-session] getUserAccountDetails failed for ${uid}: ${err.message}`);
+        }
+      }
+      ent.userDetails = userDetails;
+      console.log(`[engine-session] User account details collected for ${Object.keys(userDetails).length} users`);
+
     } catch (err: any) {
       ent.errors.push(`getUsersWithSearch: ${err.message}`);
       ent.noAdminAccess = true;
-      console.log(`[engine-session] Enterprise pre-flight FAILED with error, skipping remaining enterprise calls`);
       return ent;
     }
 
-    // getEnterpriseSettings
+    // getEnterpriseSettings (full set of settings)
     try {
-      const params = JSON.stringify({});
+      const settingKeys = [
+        'emailDomainVerification', 'cidrRestriction', 'webSessionDuration',
+        'mfaPolicy', 'ssoConfig', 'hipaaCompliance', 'ekm', 'dataResidency',
+        'sensitivityLabels', 'personalAccessTokenMaxLifetime', 'dataLossPrevention',
+        'oauthRestriction', 'sharingRestrictions', 'aiSettings',
+        'scimProvisioning', 'inviteRestrictions',
+      ];
+      const params = JSON.stringify({ settings: settingKeys });
       const data = await this.fetchInternalApi(
         `/v0.3/enterpriseAccount/${entId}/getEnterpriseSettings?stringifiedObjectParams=${encodeURIComponent(params)}`,
       );
@@ -637,7 +678,7 @@ export class SessionEngine {
       ent.errors.push(`getPendingInviteesInfo: ${err.message}`);
     }
 
-    // getWorkspaces
+    // getWorkspaces (includes workspace ownership and AI settings)
     try {
       const params = JSON.stringify({ shouldIncludeDescendantEnterpriseAccounts: false, shouldIncludeInternalWorkspaces: true });
       const data = await this.fetchInternalApi(
@@ -647,6 +688,66 @@ export class SessionEngine {
       console.log(`[engine-session] Workspaces OK`);
     } catch (err: any) {
       ent.errors.push(`getWorkspaces: ${err.message}`);
+    }
+
+    // getMemberOwnedNonEnterpriseWorkspaces (shadow/personal workspaces outside the org)
+    try {
+      const params = JSON.stringify({ includeDescendantEnterpriseAccounts: false });
+      const data = await this.fetchInternalApi(
+        `/v0.3/enterpriseAccount/${entId}/getMemberOwnedNonEnterpriseWorkspaces?stringifiedObjectParams=${encodeURIComponent(params)}`,
+      );
+      ent.shadowWorkspaces = data?.data || data;
+      console.log(`[engine-session] Shadow workspaces OK`);
+    } catch (err: any) {
+      ent.errors.push(`getMemberOwnedNonEnterpriseWorkspaces: ${err.message}`);
+    }
+
+    // getUserGroupsWithMembers
+    try {
+      const params = JSON.stringify({ shouldFetchGroupMembers: true });
+      const data = await this.fetchInternalApi(
+        `/v0.3/enterpriseAccount/${entId}/getUserGroupsWithMembers?stringifiedObjectParams=${encodeURIComponent(params)}`,
+      );
+      ent.userGroups = data?.data || data;
+      console.log(`[engine-session] User groups OK`);
+    } catch (err: any) {
+      ent.errors.push(`getUserGroupsWithMembers: ${err.message}`);
+    }
+
+    // getApplications (all bases with record counts and creation dates)
+    try {
+      const params = JSON.stringify({ shouldIncludeDescendantEnterpriseAccounts: false });
+      const data = await this.fetchInternalApi(
+        `/v0.3/enterpriseAccount/${entId}/getApplications?stringifiedObjectParams=${encodeURIComponent(params)}`,
+      );
+      ent.bases = data?.data || data;
+      console.log(`[engine-session] Applications (bases) OK`);
+    } catch (err: any) {
+      ent.errors.push(`getApplications: ${err.message}`);
+    }
+
+    // getPageBundles (interfaces)
+    try {
+      const params = JSON.stringify({ shouldIncludeDescendantEnterpriseAccounts: false });
+      const data = await this.fetchInternalApi(
+        `/v0.3/enterpriseAccount/${entId}/getPageBundles?stringifiedObjectParams=${encodeURIComponent(params)}`,
+      );
+      ent.interfaces = data?.data || data;
+      console.log(`[engine-session] Page bundles (interfaces) OK`);
+    } catch (err: any) {
+      ent.errors.push(`getPageBundles: ${err.message}`);
+    }
+
+    // getEnterpriseBillingInfoForAdminPanel
+    try {
+      const params = JSON.stringify({});
+      const data = await this.fetchInternalApi(
+        `/v0.3/enterpriseAccount/${entId}/getEnterpriseBillingInfoForAdminPanel?stringifiedObjectParams=${encodeURIComponent(params)}`,
+      );
+      ent.billing = data?.data || data;
+      console.log(`[engine-session] Billing info OK`);
+    } catch (err: any) {
+      ent.errors.push(`getEnterpriseBillingInfoForAdminPanel: ${err.message}`);
     }
 
     return ent;

@@ -255,14 +255,40 @@ export class Store {
           table_count: schema.table_count,
           field_count: schema.field_count,
           tables: (schema.tables ?? []).map((t: any) => ({
-            id: t.id, name: t.name,
-            field_count: t.fields?.length ?? 0,
-            fields: (t.fields ?? []).map((f: any) => ({ id: f.id, name: f.name, type: f.type, options: f.type === 'multipleRecordLinks' ? f.options : undefined })),
-            view_count: t.views?.length ?? 0,
+            id:           t.id,
+            name:         t.name,
+            description:  t.description || null,
+            field_count:  t.fields?.length ?? 0,
+            view_count:   t.views?.length ?? 0,
+            sourceMetadata: t.sourceMetadata || null,
+            views: (t.views ?? []).map((v: any) => ({ id: v.id, name: v.name, type: v.type })),
+            fields: (t.fields ?? []).map((f: any) => ({
+              id:          f.id,
+              name:        f.name,
+              type:        f.type,
+              description: f.description || null,
+              lock:        f.lock || null,
+              options:     f.options || null,
+            })),
           })),
         } : null,
         collaborators: schema?.collaborators ?? null,
         automation_stats: schema?.automation_stats ?? null,
+        // Third-party integrations used across automations in this base
+        integrations: [...new Set(autos.flatMap((a: any) => {
+          const sources: string[] = [];
+          const cfg = a.trigger_config;
+          if (cfg?.appName) sources.push(cfg.appName);
+          if (cfg?.connectionName) sources.push(cfg.connectionName);
+          (a.action_types || []).forEach((t: string) => {
+            if (t === 'connected app action' && cfg?.appName) sources.push(cfg.appName);
+            if (t === 'send Slack message') sources.push('Slack');
+            if (t === 'send Teams message') sources.push('Microsoft Teams');
+            if (t === 'send Google Chat') sources.push('Google Chat');
+            if (t === 'send SMS') sources.push('SMS');
+          });
+          return sources;
+        }))],
         automations: autos.map((a: any) => ({
           name: a.name, deployment_status: a.deployment_status,
           trigger: a.trigger, trigger_type_id: a.trigger_type_id,
@@ -307,7 +333,38 @@ export class Store {
           info: (findingsRes.data ?? []).filter((f: any) => f.severity === 'info').length,
         },
       },
-      environment: envData,
+      environment: envData ? {
+        ...envData,
+        enterprise: envData.enterprise ? {
+          ...envData.enterprise,
+          // Summarize PAT risk per user for quick analysis
+          patRiskSummary: (() => {
+            const details = envData.enterprise.userDetails || {};
+            return Object.entries(details).map(([uid, d]: [string, any]) => {
+              const pats = d.personalAccessTokens || [];
+              const hasExpiredPats  = pats.some((p: any) => p.expirationTime && new Date(p.expirationTime) < new Date());
+              const hasNonExpiringPats = pats.some((p: any) => !p.expirationTime);
+              const hasBroadAccess  = pats.some((p: any) => p.explicitTokenResources?.type === 'all');
+              const hasHighScopes   = pats.some((p: any) => (p.scopes || []).some((s: string) => s.includes('manage') || s.includes('write')));
+              return {
+                userId: uid,
+                patCount: pats.length,
+                hasNonExpiringPats,
+                hasExpiredPats,
+                hasBroadAccess,
+                hasHighScopes,
+                isApiAccessDisabled: d.isApiAccessDisabled,
+              };
+            }).filter((u: any) => u.patCount > 0);
+          })(),
+          // Summarize pending invites age
+          staleInvites: (() => {
+            const invites = envData.enterprise.pendingInvites?.invitees || [];
+            const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+            return invites.filter((i: any) => i.createdTime && new Date(i.createdTime) < ninetyDaysAgo).length;
+          })(),
+        } : null,
+      } : null,
       findings: findingsRes.data ?? [],
       bases,
     };
