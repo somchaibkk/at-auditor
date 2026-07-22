@@ -96,14 +96,16 @@ export class Store {
         workflow_id:      a.workflowId,
         deployment_id:    a.deploymentId,
         name:             a.name,
-        deployment_status: a.deploymentStatus,              // "deployed" | "undeployed" | null
+        deployment_status: a.deploymentStatus,
         trigger_type_id:  a.triggerTypeId,
-        trigger:          a.trigger,                        // human label
-        trigger_config:   a.triggerConfig,                  // connection/app/schedule details
+        trigger:          a.trigger,
+        trigger_config:   a.triggerConfig,
         step_count:       a.stepCount,
-        action_types:     a.actionTypes,                    // string[]
-        script_sources:   a.scriptSources,                  // { actionId, stepIndex, actionType, lines, code }[]
+        action_types:     a.actionTypes,
+        script_sources:   a.scriptSources,
         has_scripts:      a.scriptSources.length > 0,
+        created_by_user_id:     a.createdByUserId ?? null,
+        deployment_created_time: a.deploymentCreatedTime ?? null,
         error:            a.error ?? null,
       })),
     );
@@ -156,6 +158,18 @@ export class Store {
     }).eq('audit_id', this.cfg.auditId).eq('base_id', baseId);
   }
 
+  async saveBaseExtras(baseId: string, extras: {
+    hasExtensions?: boolean; aiCreditsMonth?: number;
+    aiCreditsRemaining?: number; revisionHistoryEnabled?: boolean;
+  }) {
+    await this.db.from('base_schemas').update({
+      has_extensions: extras.hasExtensions ?? null,
+      ai_credits_month: extras.aiCreditsMonth ?? null,
+      ai_credits_remaining: extras.aiCreditsRemaining ?? null,
+      revision_history_enabled: extras.revisionHistoryEnabled ?? null,
+    }).eq('audit_id', this.cfg.auditId).eq('base_id', baseId);
+  }
+
   async saveUsageStats(usageData: Record<string, any>) {
     // Merge usage stats into environment_data
     const { data: existing } = await this.db
@@ -172,6 +186,281 @@ export class Store {
       { audit_id: this.cfg.auditId, data: envData },
       { onConflict: 'audit_id' },
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Sync topology (from bootstrap /read payload)
+  // ---------------------------------------------------------------------------
+
+  async saveSyncLinks(links: Array<{
+    destBaseId: string; destTableId: string; syncId: string;
+    sourceType?: string; sourceAccountId?: string; syncState?: string;
+    lastSuccessTime?: string; lastFailureTime?: string; lastFailureInfo?: any;
+    syncFrequency?: string; shouldSyncRowDeletions?: boolean;
+    isMultiSource?: boolean; fieldMapping?: any; resyncTime?: string;
+  }>) {
+    if (!links.length) return;
+    const rows = links.map(l => ({
+      audit_id: this.cfg.auditId,
+      dest_base_id: l.destBaseId,
+      dest_table_id: l.destTableId,
+      sync_id: l.syncId,
+      source_type: l.sourceType ?? 'airtableSharedView',
+      source_account_id: l.sourceAccountId ?? null,
+      sync_state: l.syncState ?? null,
+      last_success_time: l.lastSuccessTime ?? null,
+      last_failure_time: l.lastFailureTime ?? null,
+      last_failure_info: l.lastFailureInfo ?? null,
+      sync_frequency: l.syncFrequency ?? null,
+      should_sync_row_deletions: l.shouldSyncRowDeletions ?? null,
+      is_multi_source: l.isMultiSource ?? false,
+      field_mapping: l.fieldMapping ?? null,
+      resync_time: l.resyncTime ?? null,
+    }));
+    const { error } = await this.db.from('sync_links').insert(rows);
+    if (error) console.error('[store] saveSyncLinks error:', error.message);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Interfaces inventory
+  // ---------------------------------------------------------------------------
+
+  async saveInterfaces(interfaces: Array<{
+    baseId: string; interfaceId: string; name?: string;
+    pageCount?: number; published?: boolean;
+    firstPublishedTime?: string; createdTime?: string;
+  }>) {
+    if (!interfaces.length) return;
+    const rows = interfaces.map(i => ({
+      audit_id: this.cfg.auditId,
+      base_id: i.baseId,
+      interface_id: i.interfaceId,
+      name: i.name ?? null,
+      page_count: i.pageCount ?? null,
+      published: i.published ?? null,
+      first_published_time: i.firstPublishedTime ?? null,
+      created_time: i.createdTime ?? null,
+    }));
+    for (let i = 0; i < rows.length; i += 500) {
+      const chunk = rows.slice(i, i + 500);
+      const { error } = await this.db.from('interfaces').insert(chunk);
+      if (error) console.error('[store] saveInterfaces error:', error.message);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Automation run summaries
+  // ---------------------------------------------------------------------------
+
+  async saveAutomationRuns(runs: Array<{
+    baseId: string; workflowId: string;
+    runsCurrentMonth?: number; lastRunAt?: string; lastRunStatus?: string;
+    totalRunsSampled?: number; successCount?: number; failureCount?: number;
+    oldestSampledRun?: string;
+  }>) {
+    if (!runs.length) return;
+    const rows = runs.map(r => ({
+      audit_id: this.cfg.auditId,
+      base_id: r.baseId,
+      workflow_id: r.workflowId,
+      runs_current_month: r.runsCurrentMonth ?? null,
+      last_run_at: r.lastRunAt ?? null,
+      last_run_status: r.lastRunStatus ?? null,
+      total_runs_sampled: r.totalRunsSampled ?? null,
+      success_count: r.successCount ?? null,
+      failure_count: r.failureCount ?? null,
+      oldest_sampled_run: r.oldestSampledRun ?? null,
+    }));
+    const { error } = await this.db.from('automation_runs').insert(rows);
+    if (error) console.error('[store] saveAutomationRuns error:', error.message);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Normalized per-base collaborators
+  // ---------------------------------------------------------------------------
+
+  async saveBaseCollaborators(baseId: string, collabs: Array<{
+    userId: string; email?: string; permissionLevel?: string;
+    status?: string; source?: string;
+  }>) {
+    if (!collabs.length) return;
+    const rows = collabs.map(c => ({
+      audit_id: this.cfg.auditId,
+      base_id: baseId,
+      user_id: c.userId,
+      email: c.email ?? null,
+      permission_level: c.permissionLevel ?? null,
+      status: c.status ?? null,
+      source: c.source ?? 'session',
+    }));
+    const { error } = await this.db.from('base_collaborators').insert(rows);
+    if (error) console.error('[store] saveBaseCollaborators error:', error.message);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Share links
+  // ---------------------------------------------------------------------------
+
+  async saveShareLinks(shares: Array<{
+    baseId: string; shareId: string; kind?: string;
+    isPasswordProtected?: boolean; isDomainRestricted?: boolean;
+    createdBy?: string; createdAtSource?: string;
+  }>) {
+    if (!shares.length) return;
+    const rows = shares.map(s => ({
+      audit_id: this.cfg.auditId,
+      base_id: s.baseId,
+      share_id: s.shareId,
+      kind: s.kind ?? null,
+      is_password_protected: s.isPasswordProtected ?? null,
+      is_domain_restricted: s.isDomainRestricted ?? null,
+      created_by: s.createdBy ?? null,
+      created_at_source: s.createdAtSource ?? null,
+    }));
+    const { error } = await this.db.from('share_links').insert(rows);
+    if (error) console.error('[store] saveShareLinks error:', error.message);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Integration endpoints (DERIVE)
+  // ---------------------------------------------------------------------------
+
+  async saveIntegrationEndpoints(endpoints: Array<{
+    baseId?: string; sourceKind: string; domain?: string;
+    url?: string; evidenceRef?: string;
+  }>) {
+    if (!endpoints.length) return;
+    const rows = endpoints.map(e => ({
+      audit_id: this.cfg.auditId,
+      base_id: e.baseId ?? null,
+      source_kind: e.sourceKind,
+      domain: e.domain ?? null,
+      url: e.url ?? null,
+      evidence_ref: e.evidenceRef ?? null,
+    }));
+    const { error } = await this.db.from('integration_endpoints').insert(rows);
+    if (error) console.error('[store] saveIntegrationEndpoints error:', error.message);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Table stats (row counts, attachment sizes)
+  // ---------------------------------------------------------------------------
+
+  async saveTableStats(stats: Array<{
+    baseId: string; tableId: string; tableName?: string;
+    rowCount?: number; attachmentBytesEst?: number;
+  }>) {
+    if (!stats.length) return;
+    const rows = stats.map(s => ({
+      audit_id: this.cfg.auditId,
+      base_id: s.baseId,
+      table_id: s.tableId,
+      table_name: s.tableName ?? null,
+      row_count: s.rowCount ?? null,
+      attachment_bytes_est: s.attachmentBytesEst ?? null,
+    }));
+    const { error } = await this.db.from('table_stats').insert(rows);
+    if (error) console.error('[store] saveTableStats error:', error.message);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Field stats (fill rates)
+  // ---------------------------------------------------------------------------
+
+  async saveFieldStats(stats: Array<{
+    baseId: string; tableId: string; fieldId: string;
+    fieldName?: string; fillRate?: number; sampleN?: number;
+  }>) {
+    if (!stats.length) return;
+    const rows = stats.map(s => ({
+      audit_id: this.cfg.auditId,
+      base_id: s.baseId,
+      table_id: s.tableId,
+      field_id: s.fieldId,
+      field_name: s.fieldName ?? null,
+      fill_rate: s.fillRate ?? null,
+      sample_n: s.sampleN ?? null,
+    }));
+    for (let i = 0; i < rows.length; i += 500) {
+      const chunk = rows.slice(i, i + 500);
+      const { error } = await this.db.from('field_stats').insert(chunk);
+      if (error) console.error('[store] saveFieldStats error:', error.message);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Admin users (extracted from enterprise data)
+  // ---------------------------------------------------------------------------
+
+  async saveAdminUsers(users: Array<{
+    userId: string; email?: string; displayName?: string;
+    role?: string; status?: string; lastActiveAt?: string;
+    createdAtSource?: string; twoFa?: boolean;
+  }>) {
+    if (!users.length) return;
+    const rows = users.map(u => ({
+      audit_id: this.cfg.auditId,
+      user_id: u.userId,
+      email: u.email ?? null,
+      display_name: u.displayName ?? null,
+      role: u.role ?? null,
+      status: u.status ?? null,
+      last_active_at: u.lastActiveAt ?? null,
+      created_at_source: u.createdAtSource ?? null,
+      two_fa: u.twoFa ?? null,
+    }));
+    for (let i = 0; i < rows.length; i += 500) {
+      const chunk = rows.slice(i, i + 500);
+      const { error } = await this.db.from('admin_users').insert(chunk);
+      if (error) console.error('[store] saveAdminUsers error:', error.message);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Billing snapshot
+  // ---------------------------------------------------------------------------
+
+  async saveBillingSnapshot(snapshot: {
+    plan?: string; paidSeats?: number; addons?: any;
+    nextInvoiceAmount?: number; nextInvoiceDate?: string;
+    billingCycle?: string; businessName?: string;
+    billingContact?: string; invoiceHistory?: any;
+  }) {
+    const { error } = await this.db.from('billing_snapshots').insert({
+      audit_id: this.cfg.auditId,
+      plan: snapshot.plan ?? null,
+      paid_seats: snapshot.paidSeats ?? null,
+      addons: snapshot.addons ?? null,
+      next_invoice_amount: snapshot.nextInvoiceAmount ?? null,
+      next_invoice_date: snapshot.nextInvoiceDate ?? null,
+      billing_cycle: snapshot.billingCycle ?? null,
+      business_name: snapshot.businessName ?? null,
+      billing_contact: snapshot.billingContact ?? null,
+      invoice_history: snapshot.invoiceHistory ?? null,
+    });
+    if (error) console.error('[store] saveBillingSnapshot error:', error.message);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Extensions (DOM-scraped from extensions panel)
+  // ---------------------------------------------------------------------------
+
+  async saveExtensions(baseId: string, extensions: Array<{
+    extensionName?: string; blockInstallationId?: string;
+    blockId?: string; isScripting?: boolean; scriptCode?: string;
+  }>) {
+    if (!extensions.length) return;
+    const rows = extensions.map(e => ({
+      audit_id: this.cfg.auditId,
+      base_id: baseId,
+      extension_name: e.extensionName ?? null,
+      block_installation_id: e.blockInstallationId ?? null,
+      block_id: e.blockId ?? null,
+      is_scripting: e.isScripting ?? false,
+      script_code: e.scriptCode ?? null,
+    }));
+    const { error } = await this.db.from('extensions').insert(rows);
+    if (error) console.error('[store] saveExtensions error:', error.message);
   }
 
   // ---------------------------------------------------------------------------
@@ -197,7 +486,8 @@ export class Store {
     const auditId = this.cfg.auditId;
 
     // Fetch all data
-    const [auditRes, basesRes, schemasRes, automationsRes, findingsRes, samplesRes, envRes] = await Promise.all([
+    const [auditRes, basesRes, schemasRes, automationsRes, findingsRes, samplesRes, envRes,
+           syncRes, interfacesRes, autoRunsRes, shareLinksRes, intEndpointsRes, tableStatsRes, fieldStatsRes, adminUsersRes, billingRes, extensionsRes] = await Promise.all([
       this.db.from('audits').select('*').eq('id', auditId).single(),
       this.db.from('audit_bases').select('*').eq('audit_id', auditId),
       this.db.from('base_schemas').select('base_id,table_count,field_count,tables,collaborators,automation_stats').eq('audit_id', auditId),
@@ -205,6 +495,16 @@ export class Store {
       this.db.from('findings').select('severity,category,base_id,title,detail,recommendation').eq('audit_id', auditId).order('severity'),
       this.db.from('record_samples').select('*').eq('audit_id', auditId),
       this.db.from('environment_data').select('data').eq('audit_id', auditId).limit(1),
+      this.db.from('sync_links').select('*').eq('audit_id', auditId),
+      this.db.from('interfaces').select('*').eq('audit_id', auditId),
+      this.db.from('automation_runs').select('*').eq('audit_id', auditId),
+      this.db.from('share_links').select('*').eq('audit_id', auditId),
+      this.db.from('integration_endpoints').select('*').eq('audit_id', auditId),
+      this.db.from('table_stats').select('*').eq('audit_id', auditId),
+      this.db.from('field_stats').select('*').eq('audit_id', auditId),
+      this.db.from('admin_users').select('*').eq('audit_id', auditId),
+      this.db.from('billing_snapshots').select('*').eq('audit_id', auditId),
+      this.db.from('extensions').select('*').eq('audit_id', auditId),
     ]);
 
     const audit = auditRes.data;
@@ -366,6 +666,28 @@ export class Store {
         } : null,
       } : null,
       findings: findingsRes.data ?? [],
+      sync_links: syncRes.data ?? [],
+      interfaces: interfacesRes.data ?? [],
+      automation_runs: autoRunsRes.data ?? [],
+      share_links: shareLinksRes.data ?? [],
+      integration_endpoints: intEndpointsRes.data ?? [],
+      table_stats: tableStatsRes.data ?? [],
+      field_stats_summary: (() => {
+        // Summarize field stats: only include fields with <20% fill rate to keep export small
+        const all = fieldStatsRes.data ?? [];
+        return all.filter((f: any) => f.fill_rate !== null && f.fill_rate < 20);
+      })(),
+      admin_users: (adminUsersRes.data ?? []).map((u: any) => ({
+        user_id: u.user_id, email: u.email, display_name: u.display_name,
+        role: u.role, status: u.status, two_fa: u.two_fa,
+        last_active_at: u.last_active_at,
+      })),
+      billing: billingRes.data?.[0] ?? null,
+      extensions: (extensionsRes.data ?? []).map((e: any) => ({
+        base_id: e.base_id, extension_name: e.extension_name,
+        block_installation_id: e.block_installation_id, block_id: e.block_id,
+        is_scripting: e.is_scripting, has_code: !!e.script_code,
+      })),
       bases,
     };
 

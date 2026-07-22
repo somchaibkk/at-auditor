@@ -188,6 +188,45 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
       }
     }
 
+    // --- Interface inventory (one call, all bases) ---
+    if (wantEnv || audit.config?.collect_collaborators) {
+      try {
+        await store.event('interfaces', 'Collecting interface inventory...');
+        const ifResult = await session.collectAllInterfaces();
+        if (ifResult.interfaces.length > 0) {
+          await store.saveInterfaces(ifResult.interfaces);
+          await store.event('interfaces', `Found ${ifResult.interfaces.length} interface(s)`);
+        }
+        if (ifResult.errors.length > 0) {
+          await store.event('interfaces', `Warnings: ${ifResult.errors.join('; ')}`, 'warn');
+        }
+      } catch (e: any) {
+        await store.event('interfaces', `Interface collection failed: ${e.message}`, 'warn');
+      }
+    }
+
+    // --- Extract admin users + billing from enterprise data (if collected) ---
+    if (wantEnterprise) {
+      try {
+        const { data: envRow } = await db.schema('audit').from('environment_data').select('data').eq('audit_id', audit.id).limit(1).maybeSingle();
+        const envData = envRow?.data;
+        if (envData?.enterprise) {
+          const adminUsers = SessionEngine.extractAdminUsers(envData.enterprise);
+          if (adminUsers.length > 0) {
+            await store.saveAdminUsers(adminUsers);
+            await store.event('environment', `Extracted ${adminUsers.length} admin user(s) to normalized table`);
+          }
+          const billingSnapshot = SessionEngine.extractBillingSnapshot(envData.enterprise, envData.workspace);
+          if (billingSnapshot) {
+            await store.saveBillingSnapshot(billingSnapshot);
+            await store.event('environment', `Billing snapshot saved (plan: ${billingSnapshot.plan || 'unknown'})`);
+          }
+        }
+      } catch (e: any) {
+        await store.event('environment', `Admin user/billing extraction failed: ${e.message}`, 'warn');
+      }
+    }
+
     let baseIndex = 0;
     const RESTART_EVERY = 15; // Restart browser every N bases to prevent memory exhaustion
 
@@ -274,6 +313,89 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
           await store.upsertBaseStatus(baseId, 'automations_done');
         }
 
+        // --- Bootstrap read: sync topology + share links + table stats ---
+        if (audit.config?.collect_collaborators || wantEnv) {
+          try {
+            await store.event('bootstrap', `Bootstrap read: ${baseName ?? baseId}`);
+            // Pass table IDs from schema to get row counts
+            const tblIds = tables.map((t: any) => t.id);
+            const bootstrap = await session.collectBootstrapRead(baseId, tblIds);
+
+            if (bootstrap.syncLinks.length > 0) {
+              await store.saveSyncLinks(bootstrap.syncLinks.map(sl => ({ ...sl, destBaseId: baseId })));
+              await store.event('bootstrap', `${bootstrap.syncLinks.length} sync link(s)`);
+            }
+            if (bootstrap.shares.length > 0) {
+              await store.saveShareLinks(bootstrap.shares.map(s => ({ ...s, baseId })));
+              await store.event('bootstrap', `${bootstrap.shares.length} share link(s)`);
+            }
+            if (bootstrap.tableStats.length > 0) {
+              await store.saveTableStats(bootstrap.tableStats.map(ts => ({ ...ts, baseId })));
+              await store.event('bootstrap', `Row counts for ${bootstrap.tableStats.length} table(s)`);
+            }
+            if (bootstrap.errors.length > 0) {
+              await store.event('bootstrap', bootstrap.errors.join('; '), 'warn');
+            }
+
+            // Save base-level metadata (extensions, AI, revision history)
+            await store.saveBaseExtras(baseId, {
+              hasExtensions: bootstrap.hasExtensions ?? undefined,
+              aiCreditsMonth: bootstrap.aiConsumption?.creditsMonth,
+              aiCreditsRemaining: bootstrap.aiConsumption?.creditsRemaining,
+              revisionHistoryEnabled: bootstrap.revisionHistoryEnabled ?? undefined,
+            });
+
+            // Scrape extensions if present
+            if (bootstrap.hasExtensions) {
+              try {
+                const extResult = await session.collectExtensions(baseId);
+                if (extResult.extensions.length > 0) {
+                  await store.saveExtensions(baseId, extResult.extensions);
+                  const scriptCount = extResult.extensions.filter((e: any) => e.isScripting).length;
+                  await store.event('extensions', `${extResult.extensions.length} extension(s) in ${baseName ?? baseId}${scriptCount > 0 ? `, ${scriptCount} scripting` : ''}`);
+                }
+                if (extResult.errors.length > 0) {
+                  await store.event('extensions', extResult.errors.join('; '), 'warn');
+                }
+              } catch (e: any) {
+                await store.event('extensions', `Extension scrape failed: ${e.message}`, 'warn');
+              }
+            }
+          } catch (e: any) {
+            await store.event('bootstrap', `Bootstrap read failed: ${e.message}`, 'warn');
+          }
+        }
+
+        // --- Automation run summaries (per-workflow) ---
+        if (wantAutoStats && audit.config?.include_automations !== false) {
+          try {
+            const wfIds = (await (createClient(baseConfig.supabaseUrl, baseConfig.supabaseServiceRoleKey, { auth: { persistSession: false } })
+              .schema('audit').from('automations').select('workflow_id')
+              .eq('audit_id', audit.id).eq('base_id', baseId).not('workflow_id', 'is', null)
+            )).data?.map((r: any) => r.workflow_id).filter(Boolean) || [];
+
+            if (wfIds.length > 0) {
+              const runSummaries = await session.collectAutomationRunSummaries(baseId, wfIds);
+              await store.saveAutomationRuns(runSummaries.map(s => ({ ...s, baseId })));
+              const activeCount = runSummaries.filter(s => s.runsCurrentMonth > 0).length;
+              await store.event('automations', `Run summaries: ${activeCount}/${wfIds.length} active this month`);
+            }
+          } catch (e: any) {
+            await store.event('automations', `Run summary failed: ${e.message}`, 'warn');
+          }
+        }
+
+        // --- Normalized collaborators (to base_collaborators table) ---
+        if (audit.config?.collect_collaborators && collaborators?.collaborators?.length > 0) {
+          try {
+            await store.saveBaseCollaborators(baseId, collaborators.collaborators.map((c: any) => ({
+              userId: c.userId, email: c.email, permissionLevel: c.permissionLevel, source: c.source,
+            })));
+          } catch (e: any) {
+            await store.event('collaborators', `Normalized save failed: ${e.message}`, 'warn');
+          }
+        }
+
         await store.upsertBaseStatus(baseId, 'complete');
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
@@ -304,6 +426,72 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
     }
 
     await session.stop();
+
+    // --- DERIVE: integration endpoints scan (no browser needed) ---
+    try {
+      await store.event('integrations', 'Scanning automations for integration endpoints...');
+      const db2 = createClient(baseConfig.supabaseUrl, baseConfig.supabaseServiceRoleKey, { auth: { persistSession: false } });
+      const { data: allAutos } = await db2.schema('audit').from('automations')
+        .select('base_id,workflow_id,name,script_sources,trigger_config')
+        .eq('audit_id', audit.id);
+
+      if (allAutos && allAutos.length > 0) {
+        const endpoints = SessionEngine.scanIntegrationEndpoints(allAutos);
+        if (endpoints.length > 0) {
+          await store.saveIntegrationEndpoints(endpoints);
+          const domainCounts: Record<string, number> = {};
+          for (const ep of endpoints) domainCounts[ep.domain] = (domainCounts[ep.domain] || 0) + 1;
+          const summary = Object.entries(domainCounts).sort((a, b) => b[1] - a[1]).slice(0, 10)
+            .map(([d, n]) => `${d}(${n})`).join(', ');
+          await store.event('integrations', `Found ${endpoints.length} endpoint(s): ${summary}`);
+        } else {
+          await store.event('integrations', 'No external endpoints found');
+        }
+      }
+    } catch (e: any) {
+      await store.event('integrations', `Integration scan failed: ${e.message}`, 'warn');
+    }
+
+    // --- DERIVE: field fill rates from record samples ---
+    try {
+      const db3 = createClient(baseConfig.supabaseUrl, baseConfig.supabaseServiceRoleKey, { auth: { persistSession: false } });
+      const { data: samples } = await db3.schema('audit').from('record_samples')
+        .select('base_id,table_id,sample,sampled_count').eq('audit_id', audit.id);
+
+      if (samples && samples.length > 0) {
+        const fieldStats: any[] = [];
+        for (const s of samples) {
+          const records = s.sample || [];
+          if (!records.length) continue;
+          const n = records.length;
+          const fills: Record<string, { nonEmpty: number }> = {};
+          for (const rec of records) {
+            const fields = rec.fields || rec.fieldSummary || {};
+            for (const [key, val] of Object.entries(fields)) {
+              if (!fills[key]) fills[key] = { nonEmpty: 0 };
+              if (rec.fieldSummary) {
+                if (!(val as any)?.empty) fills[key].nonEmpty++;
+              } else {
+                if (val !== null && val !== '' && val !== undefined) fills[key].nonEmpty++;
+              }
+            }
+          }
+          for (const [fieldName, info] of Object.entries(fills)) {
+            fieldStats.push({
+              baseId: s.base_id, tableId: s.table_id, fieldId: fieldName,
+              fieldName, fillRate: Math.round((info.nonEmpty / n) * 10000) / 100, sampleN: n,
+            });
+          }
+        }
+        if (fieldStats.length > 0) {
+          await store.saveFieldStats(fieldStats);
+          await store.event('analysis', `Computed fill rates for ${fieldStats.length} field(s)`);
+        }
+      }
+    } catch (e: any) {
+      await store.event('analysis', `Field fill rate computation failed: ${e.message}`, 'warn');
+    }
+
     await store.setAuditStatus('analysing');
     await store.event('analyse', 'Running analysis...');
 

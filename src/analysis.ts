@@ -229,6 +229,17 @@ export async function runAnalysis(cfg: AnalysisConfig): Promise<void> {
     .select('*')
     .eq('audit_id', cfg.auditId);
 
+  // Fetch new capture-gap tables
+  const { data: syncLinks } = await client.from('sync_links').select('*').eq('audit_id', cfg.auditId);
+  const { data: interfaces } = await client.from('interfaces').select('*').eq('audit_id', cfg.auditId);
+  const { data: automationRuns } = await client.from('automation_runs').select('*').eq('audit_id', cfg.auditId);
+  const { data: shareLinks } = await client.from('share_links').select('*').eq('audit_id', cfg.auditId);
+  const { data: integrationEndpoints } = await client.from('integration_endpoints').select('*').eq('audit_id', cfg.auditId);
+  const { data: tableStats } = await client.from('table_stats').select('*').eq('audit_id', cfg.auditId);
+  const { data: fieldStats } = await client.from('field_stats').select('*').eq('audit_id', cfg.auditId);
+  const { data: adminUsers } = await client.from('admin_users').select('*').eq('audit_id', cfg.auditId);
+  const { data: billingSnapshots } = await client.from('billing_snapshots').select('*').eq('audit_id', cfg.auditId);
+
   const baseIds = (auditBases ?? []).map((b: any) => b.airtable_base_id as string);
 
   // Fetch environment data
@@ -704,6 +715,396 @@ export async function runAnalysis(cfg: AnalysisConfig): Promise<void> {
             recommendation: 'Open this automation in Airtable to identify which marketplace app is connected.',
           });
         }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Capture-gap findings: sync, shares, runs, integrations, row counts, users
+  // ---------------------------------------------------------------------------
+
+  // -- SYNC: failure and complexity -------------------------------------------
+  if (syncLinks && syncLinks.length > 0) {
+    const failedSyncs = syncLinks.filter((s: any) => s.last_failure_time && !s.last_success_time);
+    const staleSyncs = syncLinks.filter((s: any) => {
+      if (!s.last_success_time) return false;
+      const age = Date.now() - new Date(s.last_success_time).getTime();
+      return age > 7 * 24 * 60 * 60 * 1000; // > 7 days
+    });
+    const multiSource = syncLinks.filter((s: any) => s.is_multi_source);
+
+    if (failedSyncs.length > 0) {
+      findings.push({
+        audit_id: cfg.auditId, severity: 'high', category: 'drift', base_id: null,
+        title: `${failedSyncs.length} sync link(s) in failure state`,
+        detail: failedSyncs.map((s: any) => `Table ${s.dest_table_id} in base ${s.dest_base_id}: last failure ${s.last_failure_time}`).join('\n'),
+        recommendation: 'Check the source bases/views for these syncs. The shared view or source table may have been deleted or permissions revoked.',
+      });
+    }
+
+    if (staleSyncs.length > 0) {
+      findings.push({
+        audit_id: cfg.auditId, severity: 'medium', category: 'drift', base_id: null,
+        title: `${staleSyncs.length} sync link(s) have not synced in over 7 days`,
+        detail: staleSyncs.map((s: any) => `Table ${s.dest_table_id}: last success ${s.last_success_time}`).join('\n'),
+        recommendation: 'Stale syncs may indicate a broken source. Verify the sync is still needed and that the source view is accessible.',
+      });
+    }
+
+    if (multiSource.length > 0) {
+      findings.push({
+        audit_id: cfg.auditId, severity: 'info', category: 'complexity', base_id: null,
+        title: `${multiSource.length} multi-source synced table(s) detected`,
+        detail: 'Tables syncing from multiple sources are harder to debug when data conflicts arise.',
+        recommendation: null,
+      });
+    }
+
+    findings.push({
+      audit_id: cfg.auditId, severity: 'info', category: 'complexity', base_id: null,
+      title: `Sync topology: ${syncLinks.length} sync link(s) across the environment`,
+      detail: `Sources: ${[...new Set(syncLinks.map((s: any) => s.source_type))].join(', ')}`,
+      recommendation: null,
+    });
+  }
+
+  // -- SHARE LINKS: unprotected shares ----------------------------------------
+  if (shareLinks && shareLinks.length > 0) {
+    const unprotected = shareLinks.filter((s: any) => !s.is_password_protected && !s.is_domain_restricted);
+    if (unprotected.length > 0) {
+      findings.push({
+        audit_id: cfg.auditId, severity: 'high', category: 'security', base_id: null,
+        title: `${unprotected.length} publicly shared link(s) without password or domain restriction`,
+        detail: unprotected.map((s: any) => `Base ${s.base_id}: ${s.kind || 'unknown type'} share ${s.share_id}`).join('\n'),
+        recommendation: 'Add password protection or domain restrictions to shared links, especially for bases containing product data or financials.',
+      });
+    }
+    findings.push({
+      audit_id: cfg.auditId, severity: 'info', category: 'security', base_id: null,
+      title: `${shareLinks.length} shared link(s) found across the environment`,
+      detail: `Protected: ${shareLinks.length - unprotected.length}, Unprotected: ${unprotected.length}`,
+      recommendation: null,
+    });
+  }
+
+  // -- AUTOMATION RUNS: kill-list, watch-list, protect-list -------------------
+  if (automationRuns && automationRuns.length > 0) {
+    const allAutos = automations ?? [];
+    const neverRan = automationRuns.filter((r: any) =>
+      r.total_runs_sampled === 0 && r.runs_current_month === 0
+    );
+    const failing = automationRuns.filter((r: any) => r.failure_count > 0);
+    const highFreq = automationRuns.filter((r: any) => r.runs_current_month > 100);
+
+    // Kill-list: undeployed AND never ran
+    const undeployedIds = new Set(allAutos.filter((a: any) => a.deployment_status === 'undeployed').map((a: any) => a.workflow_id));
+    const killCandidates = neverRan.filter((r: any) => undeployedIds.has(r.workflow_id));
+    if (killCandidates.length > 0) {
+      const names = killCandidates.map((r: any) => {
+        const auto = allAutos.find((a: any) => a.workflow_id === r.workflow_id);
+        return auto?.name || r.workflow_id;
+      });
+      findings.push({
+        audit_id: cfg.auditId, severity: 'medium', category: 'hygiene', base_id: null,
+        title: `${killCandidates.length} automation(s) are undeployed and have never run (kill candidates)`,
+        detail: names.join('\n'),
+        recommendation: 'These automations appear to be abandoned drafts. Delete them to reduce clutter.',
+      });
+    }
+
+    if (failing.length > 0) {
+      const details = failing.map((r: any) => {
+        const auto = allAutos.find((a: any) => a.workflow_id === r.workflow_id);
+        return `${auto?.name || r.workflow_id}: ${r.failure_count}/${r.total_runs_sampled} failures (last run: ${r.last_run_status} at ${r.last_run_at})`;
+      });
+      findings.push({
+        audit_id: cfg.auditId, severity: 'high', category: 'automation', base_id: null,
+        title: `${failing.length} automation(s) have recent failures (watch-list)`,
+        detail: details.join('\n'),
+        recommendation: 'Review failing automations in the Airtable automation run history. Fix or disable automations with persistent errors.',
+      });
+    }
+
+    if (highFreq.length > 0) {
+      const details = highFreq.map((r: any) => {
+        const auto = allAutos.find((a: any) => a.workflow_id === r.workflow_id);
+        return `${auto?.name || r.workflow_id}: ${r.runs_current_month} runs this month`;
+      });
+      findings.push({
+        audit_id: cfg.auditId, severity: 'info', category: 'automation', base_id: null,
+        title: `${highFreq.length} high-frequency automation(s) (>100 runs/month, protect-list)`,
+        detail: details.join('\n'),
+        recommendation: 'These are critical automations. Document their purpose and ensure they have error handling.',
+      });
+    }
+  }
+
+  // -- INTEGRATION ENDPOINTS: inventory ---------------------------------------
+  if (integrationEndpoints && integrationEndpoints.length > 0) {
+    const byDomain: Record<string, number> = {};
+    for (const ep of integrationEndpoints) {
+      byDomain[ep.domain] = (byDomain[ep.domain] || 0) + 1;
+    }
+    const domainList = Object.entries(byDomain).sort((a, b) => b[1] - a[1])
+      .map(([d, n]) => `${d} (${n})`).join(', ');
+
+    findings.push({
+      audit_id: cfg.auditId, severity: 'medium', category: 'security', base_id: null,
+      title: `${integrationEndpoints.length} external integration endpoint(s) discovered across ${Object.keys(byDomain).length} domain(s)`,
+      detail: domainList,
+      recommendation: 'Verify all external integrations are authorized and documented. Unknown domains may indicate shadow integrations built by individual users.',
+    });
+  }
+
+  // -- ROW COUNTS: approaching limits -----------------------------------------
+  if (tableStats && tableStats.length > 0) {
+    const ROW_LIMIT = 125_000; // Business plan limit per table
+    const WARNING_THRESHOLD = 0.8;
+    const nearLimit = tableStats.filter((ts: any) => ts.row_count && ts.row_count >= ROW_LIMIT * WARNING_THRESHOLD);
+    if (nearLimit.length > 0) {
+      findings.push({
+        audit_id: cfg.auditId, severity: 'high', category: 'complexity', base_id: null,
+        title: `${nearLimit.length} table(s) approaching or exceeding the ${ROW_LIMIT.toLocaleString()} row limit`,
+        detail: nearLimit.map((ts: any) => `${ts.table_name || ts.table_id} in base ${ts.base_id}: ${ts.row_count?.toLocaleString()} rows (${Math.round((ts.row_count / ROW_LIMIT) * 100)}%)`).join('\n'),
+        recommendation: 'Archive old records or split tables before hitting the limit. Row-cap breaches block new record creation.',
+      });
+    }
+  }
+
+  // -- FIELD FILL RATES: dead fields ------------------------------------------
+  if (fieldStats && fieldStats.length > 0) {
+    const deadFields = fieldStats.filter((fs: any) => fs.fill_rate !== null && fs.fill_rate < 5 && fs.sample_n >= 10);
+    if (deadFields.length > 20) {
+      // Group by base for readability
+      const byBase: Record<string, number> = {};
+      for (const df of deadFields) {
+        byBase[df.base_id] = (byBase[df.base_id] || 0) + 1;
+      }
+      findings.push({
+        audit_id: cfg.auditId, severity: 'low', category: 'hygiene', base_id: null,
+        title: `${deadFields.length} field(s) with <5% fill rate (dead field candidates)`,
+        detail: Object.entries(byBase).map(([bid, n]) => {
+          const bn = (auditBases ?? []).find((b: any) => b.airtable_base_id === bid)?.base_name || bid;
+          return `${bn}: ${n} near-empty field(s)`;
+        }).join('\n'),
+        recommendation: 'Review near-empty fields for cleanup. Fields that were never populated are safe to remove. Fields with very low usage may indicate abandoned features.',
+      });
+    }
+  }
+
+  // -- ADMIN USERS: ghost seats, 2FA gaps -------------------------------------
+  if (adminUsers && adminUsers.length > 0) {
+    // Ghost seats: status is not active
+    const ghostSeats = adminUsers.filter((u: any) => u.status && u.status !== 'active');
+    if (ghostSeats.length > 0) {
+      findings.push({
+        audit_id: cfg.auditId, severity: 'medium', category: 'security', base_id: null,
+        title: `${ghostSeats.length} user(s) are not in active status`,
+        detail: ghostSeats.map((u: any) => `${u.email || u.user_id}: status="${u.status}"`).join('\n'),
+        recommendation: 'Review inactive users for potential seat savings. Deactivated users still count toward billing if not fully removed.',
+      });
+    }
+
+    // 2FA gaps
+    const no2fa = adminUsers.filter((u: any) => u.two_fa === false && u.status === 'active');
+    if (no2fa.length > 0) {
+      findings.push({
+        audit_id: cfg.auditId, severity: 'medium', category: 'security', base_id: null,
+        title: `${no2fa.length} active user(s) without two-factor authentication`,
+        detail: no2fa.length <= 10 ? no2fa.map((u: any) => u.email || u.user_id).join('\n') : `${no2fa.length} users (list too long to show)`,
+        recommendation: 'Enable 2FA enforcement at the enterprise level to protect against credential theft.',
+      });
+    }
+  }
+
+  // -- BILLING: seat utilization ----------------------------------------------
+  if (billingSnapshots && billingSnapshots.length > 0) {
+    const snap = billingSnapshots[0];
+    if (snap.paid_seats && adminUsers && adminUsers.length > 0) {
+      const activeUsers = adminUsers.filter((u: any) => u.status === 'active').length;
+      const utilization = activeUsers / snap.paid_seats;
+      if (utilization < 0.7) {
+        findings.push({
+          audit_id: cfg.auditId, severity: 'medium', category: 'security', base_id: null,
+          title: `Seat utilization at ${Math.round(utilization * 100)}% (${activeUsers} active / ${snap.paid_seats} paid)`,
+          detail: `${snap.paid_seats - activeUsers} paid seat(s) are not being used by active users.`,
+          recommendation: 'Review whether paid seats can be reduced at next renewal to match actual active user count.',
+        });
+      }
+    }
+  }
+
+  // -- INTERFACES: summary ----------------------------------------------------
+  if (interfaces && interfaces.length > 0) {
+    // Count per base
+    const ifByBase: Record<string, number> = {};
+    for (const iface of interfaces) {
+      ifByBase[iface.base_id] = (ifByBase[iface.base_id] || 0) + 1;
+    }
+    findings.push({
+      audit_id: cfg.auditId, severity: 'info', category: 'complexity', base_id: null,
+      title: `${interfaces.length} interface(s) across ${Object.keys(ifByBase).length} base(s)`,
+      detail: Object.entries(ifByBase).sort((a, b) => b[1] - a[1]).slice(0, 10)
+        .map(([bid, n]) => {
+          const bn = (auditBases ?? []).find((b: any) => b.airtable_base_id === bid)?.base_name || bid;
+          return `${bn}: ${n}`;
+        }).join('\n'),
+      recommendation: null,
+    });
+  }
+
+  // -- PORTAL GUESTS: from admin users with portal/guest seat type -----------
+  if (adminUsers && adminUsers.length > 0) {
+    const portalUsers = adminUsers.filter((u: any) =>
+      u.role && (u.role.toLowerCase().includes('portal') || u.role.toLowerCase().includes('guest'))
+    );
+    if (portalUsers.length > 0) {
+      findings.push({
+        audit_id: cfg.auditId, severity: 'info', category: 'security', base_id: null,
+        title: `${portalUsers.length} portal/guest user(s) detected`,
+        detail: portalUsers.length <= 20
+          ? portalUsers.map((u: any) => `${u.email || u.user_id} (${u.role})`).join('\n')
+          : `${portalUsers.length} portal/guest users (too many to list)`,
+        recommendation: 'Review portal guest access against active interface usage. Unused portal slots are billable.',
+      });
+    }
+  }
+
+  // -- AI FIELDS: count aiText fields from schema (DERIVE 2.6) ---------------
+  {
+    let aiFieldCount = 0;
+    const aiFieldBases: string[] = [];
+    for (const schema of (schemas ?? [])) {
+      const tables = schema.tables ?? [];
+      let baseHasAi = false;
+      for (const table of tables) {
+        for (const field of (table.fields ?? [])) {
+          if (field.type === 'aiText') {
+            aiFieldCount++;
+            baseHasAi = true;
+          }
+        }
+      }
+      if (baseHasAi) {
+        const bn = (auditBases ?? []).find((b: any) => b.airtable_base_id === schema.base_id)?.base_name || schema.base_id;
+        aiFieldBases.push(bn);
+      }
+    }
+    if (aiFieldCount > 0) {
+      findings.push({
+        audit_id: cfg.auditId, severity: 'info', category: 'complexity', base_id: null,
+        title: `${aiFieldCount} AI text field(s) across ${aiFieldBases.length} base(s)`,
+        detail: `Bases with AI fields: ${aiFieldBases.join(', ')}`,
+        recommendation: 'AI fields consume credits from the Airtable AI add-on. Verify usage is intentional and concentrated where it adds value.',
+      });
+    }
+  }
+
+  // -- RECORD STALENESS: zombie tables from sample timestamps (3.3) ----------
+  if (recordSamples && recordSamples.length > 0) {
+    const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    const zombieTables: string[] = [];
+
+    for (const sample of recordSamples) {
+      const records = sample.sample || [];
+      if (records.length < 5) continue; // skip tiny samples
+
+      // Check if all sampled records are older than 90 days
+      const timestamps = records
+        .map((r: any) => r.createdTime)
+        .filter(Boolean)
+        .map((t: string) => new Date(t));
+
+      if (timestamps.length === 0) continue;
+
+      const newest = new Date(Math.max(...timestamps.map((d: Date) => d.getTime())));
+      if (newest < ninetyDaysAgo) {
+        const baseName = (auditBases ?? []).find((b: any) => b.airtable_base_id === sample.base_id)?.base_name || sample.base_id;
+        const tableName = sample.table_name || sample.table_id;
+        const ageInDays = Math.round((Date.now() - newest.getTime()) / (24 * 60 * 60 * 1000));
+        zombieTables.push(`${baseName} / ${tableName}: newest record is ${ageInDays} days old`);
+      }
+    }
+
+    if (zombieTables.length > 0) {
+      findings.push({
+        audit_id: cfg.auditId, severity: 'low', category: 'hygiene', base_id: null,
+        title: `${zombieTables.length} table(s) with no new records in 90+ days (potential zombie tables)`,
+        detail: zombieTables.slice(0, 20).join('\n') + (zombieTables.length > 20 ? `\n...and ${zombieTables.length - 20} more` : ''),
+        recommendation: 'Tables with no recent activity may be candidates for archiving. Verify with stakeholders before removing.',
+      });
+    }
+  }
+
+  // -- AUTOMATION AUTHORSHIP: knowledge concentration (2.2) -------------------
+  if (automations && automations.length > 0) {
+    const deployedWithAuthor = (automations ?? []).filter((a: any) => a.created_by_user_id);
+    if (deployedWithAuthor.length > 0) {
+      const authorCounts: Record<string, number> = {};
+      for (const a of deployedWithAuthor) {
+        authorCounts[a.created_by_user_id] = (authorCounts[a.created_by_user_id] || 0) + 1;
+      }
+      const sorted = Object.entries(authorCounts).sort((a, b) => b[1] - a[1]);
+      const topAuthor = sorted[0];
+      const topPct = Math.round((topAuthor[1] / deployedWithAuthor.length) * 100);
+
+      if (topPct >= 60 && deployedWithAuthor.length >= 5) {
+        const authorUser = (adminUsers ?? []).find((u: any) => u.user_id === topAuthor[0]);
+        const authorName = authorUser?.email || authorUser?.display_name || topAuthor[0];
+        findings.push({
+          audit_id: cfg.auditId, severity: 'medium', category: 'security', base_id: null,
+          title: `Knowledge concentration: ${topPct}% of automations created by a single user`,
+          detail: `${authorName} created ${topAuthor[1]} of ${deployedWithAuthor.length} deployed automations.`,
+          recommendation: 'Cross-train team members on automation maintenance. A single point of failure for automation knowledge is a business risk.',
+        });
+      }
+    }
+  }
+
+  // -- AI CONSUMPTION: per-base credit usage (2.6) ----------------------------
+  {
+    const basesWithAi = (schemas ?? []).filter((s: any) => s.ai_credits_month && s.ai_credits_month > 0);
+    if (basesWithAi.length > 0) {
+      const totalCredits = basesWithAi.reduce((sum: number, s: any) => sum + (s.ai_credits_month || 0), 0);
+      findings.push({
+        audit_id: cfg.auditId, severity: 'info', category: 'complexity', base_id: null,
+        title: `AI credit consumption: ${totalCredits} credits this month across ${basesWithAi.length} base(s)`,
+        detail: basesWithAi.sort((a: any, b: any) => (b.ai_credits_month || 0) - (a.ai_credits_month || 0))
+          .map((s: any) => { const bn = (auditBases ?? []).find((b: any) => b.airtable_base_id === s.base_id)?.base_name || s.base_id; return `${bn}: ${s.ai_credits_month} credits`; }).join('\n'),
+        recommendation: 'Review which bases consume AI credits. Concentrated usage may allow scoping down the add-on.',
+      });
+    }
+  }
+
+  // -- EXTENSIONS: inventory from DOM scrape + flag (2.3) ----------------------
+  const { data: extensions } = await client.from('extensions').select('*').eq('audit_id', cfg.auditId);
+  {
+    if (extensions && extensions.length > 0) {
+      const byBase: Record<string, string[]> = {};
+      for (const ext of extensions) {
+        const bn = (auditBases ?? []).find((b: any) => b.airtable_base_id === ext.base_id)?.base_name || ext.base_id;
+        if (!byBase[bn]) byBase[bn] = [];
+        byBase[bn].push(ext.extension_name || 'unnamed');
+      }
+      const scriptExts = extensions.filter((e: any) => e.is_scripting);
+      findings.push({
+        audit_id: cfg.auditId, severity: scriptExts.length > 0 ? 'medium' : 'info', category: 'complexity', base_id: null,
+        title: `${extensions.length} extension(s) found across ${Object.keys(byBase).length} base(s)${scriptExts.length > 0 ? `, including ${scriptExts.length} scripting extension(s)` : ''}`,
+        detail: Object.entries(byBase).map(([bn, names]) => `${bn}: ${names.join(', ')}`).join('\n'),
+        recommendation: scriptExts.length > 0
+          ? 'Scripting extensions contain custom code that should be reviewed for security, API usage, and maintainability alongside automation scripts.'
+          : 'Extensions can contain third-party integrations. Verify all installed extensions are authorized.',
+      });
+    } else {
+      // Fall back to boolean flag
+      const basesWithExt = (schemas ?? []).filter((s: any) => s.has_extensions === true);
+      if (basesWithExt.length > 0) {
+        findings.push({
+          audit_id: cfg.auditId, severity: 'info', category: 'complexity', base_id: null,
+          title: `${basesWithExt.length} base(s) have extensions/blocks installed`,
+          detail: basesWithExt.map((s: any) => (auditBases ?? []).find((b: any) => b.airtable_base_id === s.base_id)?.base_name || s.base_id).join(', '),
+          recommendation: 'Extensions can contain custom code and third-party integrations. Inventory installed extensions for security awareness.',
+        });
       }
     }
   }

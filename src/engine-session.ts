@@ -37,6 +37,8 @@ export interface CollectedAutomation {
   stepCount:        number;
   actionTypes:      string[];
   scriptSources:    ScriptSource[];
+  createdByUserId?: string | null;
+  deploymentCreatedTime?: string | null;
   error?:           string;
 }
 
@@ -447,7 +449,7 @@ export class SessionEngine {
       const data = await this.fetchInternalApi(
         `/v0.3/workflow/${workflowId}/listExecutions?stringifiedObjectParams=%7B%22filter%22%3Anull%2C%22createdBefore%22%3Anull%7D`,
       );
-      return data?.data?.executions || data?.executions || [];
+      return data?.data?.workflowExecutions || data?.data?.executions || [];
     } catch {
       return [];
     }
@@ -531,6 +533,444 @@ export class SessionEngine {
     const coveredBases = Object.keys(result.byBase).length;
     console.log(`[engine-session] Usage stats: ${coveredBases}/${baseIds.length} bases have per-base data`);
     return result;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Bootstrap /read: sync topology + share links per base
+  // Confirmed: /v0.3/application/{appId}/read with allowMsgpackOfResult:false
+  // returns JSON. Needs x-time-zone + x-airtable-application-id headers.
+  // ---------------------------------------------------------------------------
+
+  async collectBootstrapRead(appId: string, tableIds?: string[]): Promise<{
+    syncLinks: any[];
+    shares: any[];
+    tableStats: any[];
+    hasExtensions: boolean | null;
+    aiConsumption: { creditsMonth: number; creditsRemaining: number } | null;
+    revisionHistoryEnabled: boolean | null;
+    errors: string[];
+  }> {
+    const out = { syncLinks: [] as any[], shares: [] as any[], tableStats: [] as any[],
+      hasExtensions: null as boolean | null, aiConsumption: null as any, revisionHistoryEnabled: null as boolean | null,
+      errors: [] as string[] };
+
+    try {
+      // Navigate to the base to activate cookies
+      await this.page.goto(`https://airtable.com/${appId}`, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      await new Promise(r => setTimeout(r, 5000));
+
+      const payload = await this.page.evaluate(
+        async (args: { appId: string; tableIds: string[] | null }) => {
+          const params: Record<string, any> = {
+            includeDataForTableIds: args.tableIds,
+            includeDataForViewIds: null,
+            shouldIncludeSchemaChecksum: false,
+            mayOnlyIncludeRowAndCellDataForIncludedViews: true,
+            mayExcludeCellDataForLargeViews: true,
+            allowMsgpackOfResult: false,
+            canClientSupportPreviewMode: false,
+          };
+          var url =
+            '/v0.3/application/' + args.appId + '/read?stringifiedObjectParams=' +
+            encodeURIComponent(JSON.stringify(params));
+          var resp = await fetch(url, {
+            headers: {
+              'accept': 'application/json',
+              'x-airtable-inter-service-client': 'webClient',
+              'x-requested-with': 'XMLHttpRequest',
+              'x-time-zone': 'UTC',
+              'x-airtable-application-id': args.appId,
+            },
+          });
+          if (!resp.ok) return { _err: 'HTTP ' + resp.status };
+          var ct = resp.headers.get('content-type') || '';
+          if (!ct.includes('json')) return { _err: 'not JSON: ' + ct };
+          var json = await resp.json();
+          var d = json.data || json;
+
+          // Sync links from tableSchemas
+          var syncLinks: any[] = [];
+          var schemas = d.tableSchemas || [];
+          for (var si = 0; si < schemas.length; si++) {
+            var ts = schemas[si];
+            var syncById = ts.externalTableSyncById || {};
+            var syncIds = Object.keys(syncById);
+            var isMulti = syncIds.length > 1;
+            for (var sk = 0; sk < syncIds.length; sk++) {
+              var syncId = syncIds[sk];
+              var se = syncById[syncId];
+              syncLinks.push({
+                destTableId: ts.id || null,
+                syncId: syncId,
+                sourceType: (se.dataSourceConfig || {}).dataSourceType || 'unknown',
+                sourceAccountId: (se.dataSourceConfig || {}).externalAccountId || null,
+                syncState: se.syncState || null,
+                isMultiSource: isMulti,
+                fieldMapping: (se.dataSourceConfig || {}).externalFieldIdByColumnId || null,
+              });
+            }
+            var tgt = ts.externalTableSyncTargetConfiguration;
+            if (tgt && syncIds.length > 0) {
+              var first = syncLinks[syncLinks.length - syncIds.length];
+              if (first) {
+                first.syncState = tgt.syncState || first.syncState;
+                first.lastSuccessTime = tgt.lastSuccessTime || null;
+                first.lastFailureTime = tgt.lastFailureTime || null;
+                first.lastFailureInfo = tgt.lastFailureInfo || null;
+                first.syncFrequency = (tgt.metadata || {}).syncFrequency || null;
+                first.shouldSyncRowDeletions = (tgt.metadata || {}).shouldSyncRowDeletions;
+                first.resyncTime = tgt.resyncTime || null;
+              }
+            }
+          }
+
+          // Share links from sharesById
+          var shares: any[] = [];
+          var sharesMap = d.sharesById || {};
+          var shareKeys = Object.keys(sharesMap);
+          for (var shi = 0; shi < shareKeys.length; shi++) {
+            var sid = shareKeys[shi];
+            var sh = sharesMap[sid];
+            shares.push({
+              shareId: sid,
+              kind: sh.type || sh.shareType || null,
+              isPasswordProtected: sh.isPasswordProtected || false,
+              isDomainRestricted: sh.restrictedDomains ? true : false,
+            });
+          }
+
+          // Table stats from tableDatas (if table IDs were included)
+          var tableStats: any[] = [];
+          var tableDatas = d.tableDatas || [];
+          if (Array.isArray(tableDatas)) {
+            for (var ti = 0; ti < tableDatas.length; ti++) {
+              var td = tableDatas[ti];
+              if (td && td.id) {
+                tableStats.push({
+                  tableId: td.id,
+                  tableName: td.name || null,
+                  rowCount: td.rowCount != null ? td.rowCount : (td.rows ? td.rows.length : null),
+                });
+              }
+            }
+          } else if (tableDatas && typeof tableDatas === 'object') {
+            var tdKeys = Object.keys(tableDatas);
+            for (var tdi = 0; tdi < tdKeys.length; tdi++) {
+              var tdk = tdKeys[tdi];
+              var tdv = tableDatas[tdk];
+              if (tdv) {
+                tableStats.push({
+                  tableId: tdk,
+                  tableName: tdv.name || null,
+                  rowCount: tdv.rowCount != null ? tdv.rowCount : (tdv.rows ? tdv.rows.length : null),
+                });
+              }
+            }
+          }
+
+          // Extensions, AI consumption, revision history
+          var hasExtensions = d.hasBlockInstallations || false;
+          var revisionHistoryEnabled = d.isRevisionHistoryEnabled || false;
+          var aiConsumption = null;
+          var aiInfo = d.aiConsumptionInfo;
+          if (aiInfo) {
+            aiConsumption = {
+              creditsMonth: aiInfo.creditsConsumedForMonth || 0,
+              creditsRemaining: aiInfo.remainingCreditsForMonth || 0,
+            };
+          }
+
+          return { syncLinks: syncLinks, shares: shares, tableStats: tableStats,
+            hasExtensions: hasExtensions, aiConsumption: aiConsumption, revisionHistoryEnabled: revisionHistoryEnabled };
+        },
+        { appId, tableIds: tableIds ?? null },
+      );
+
+      if ((payload as any)._err) {
+        out.errors.push(`Bootstrap read ${appId}: ${(payload as any)._err}`);
+        return out;
+      }
+
+      out.syncLinks = (payload as any).syncLinks || [];
+      out.shares = (payload as any).shares || [];
+      out.tableStats = (payload as any).tableStats || [];
+      out.hasExtensions = (payload as any).hasExtensions ?? null;
+      out.aiConsumption = (payload as any).aiConsumption ?? null;
+      out.revisionHistoryEnabled = (payload as any).revisionHistoryEnabled ?? null;
+      console.log(`[engine-session] Bootstrap ${appId}: ${out.syncLinks.length} sync, ${out.shares.length} shares, ${out.tableStats.length} table stats, extensions=${out.hasExtensions}, ai=${out.aiConsumption?.creditsMonth ?? 'n/a'}`);
+    } catch (err: any) {
+      out.errors.push(`Bootstrap read ${appId}: ${err.message}`);
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Interfaces: listApplicationsAndPageBundlesForDisplay (one call, all bases)
+  // ---------------------------------------------------------------------------
+
+  async collectAllInterfaces(): Promise<{ interfaces: any[]; errors: string[] }> {
+    const out = { interfaces: [] as any[], errors: [] as string[] };
+    try {
+      await this.page.goto('https://airtable.com/', { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      await new Promise(r => setTimeout(r, 3000));
+
+      const data = await this.page.evaluate(async () => {
+        var html = document.documentElement.innerHTML;
+        var um = html.match(/"userId"\s*:\s*"(usr[a-zA-Z0-9]+)"/);
+        if (!um) return { _err: 'no userId' };
+        var params = { shouldIncludePageBundleSharingApplications: true, shouldIncludePageBundleIndex: true };
+        var url = '/v0.3/user/' + um[1] + '/listApplicationsAndPageBundlesForDisplay?stringifiedObjectParams=' + encodeURIComponent(JSON.stringify(params));
+        var resp = await fetch(url, { headers: { 'x-airtable-inter-service-client': 'webClient', 'x-requested-with': 'XMLHttpRequest' } });
+        if (!resp.ok) return { _err: 'HTTP ' + resp.status };
+        var json = await resp.json();
+        var d = json.data || json;
+        var pbs = d.pageBundles || [];
+        return {
+          interfaces: pbs.map(function(pb: any) {
+            return { baseId: pb.applicationId, interfaceId: pb.id, name: pb.name || null, createdTime: pb.createdTime || null, firstPublishedTime: pb.firstPagePublishedTime || null };
+          }),
+        };
+      });
+
+      if ((data as any)._err) { out.errors.push((data as any)._err); return out; }
+      out.interfaces = (data as any).interfaces || [];
+      console.log(`[engine-session] Collected ${out.interfaces.length} interface(s)`);
+    } catch (err: any) {
+      out.errors.push(`Interfaces: ${err.message}`);
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Automation run summaries: monthly counts + last-run per workflow
+  // ---------------------------------------------------------------------------
+
+  async collectAutomationRunSummaries(appId: string, workflowIds: string[]): Promise<any[]> {
+    const summaries: any[] = [];
+
+    // Monthly counts (one call for all workflows in this base)
+    let monthlyCounts: Record<string, number> = {};
+    try {
+      const d = await this.fetchInternalApi(
+        `/v0.3/application/${appId}/getWorkflowExecutionCountsInCurrentMonth?stringifiedObjectParams=%7B%7D`,
+      );
+      monthlyCounts = d?.data?.workflowExecutionCountByWorkflowId || {};
+    } catch { /* non-fatal */ }
+
+    // Per-workflow: first page of listExecutions (20 runs)
+    for (const wfId of workflowIds) {
+      const s: any = {
+        workflowId: wfId, runsCurrentMonth: monthlyCounts[wfId] ?? 0,
+        lastRunAt: null, lastRunStatus: null,
+        totalRunsSampled: 0, successCount: 0, failureCount: 0, oldestSampledRun: null,
+      };
+      try {
+        const d = await this.fetchInternalApi(
+          `/v0.3/workflow/${wfId}/listExecutions?stringifiedObjectParams=%7B%22filter%22%3Anull%2C%22createdBefore%22%3Anull%7D`,
+        );
+        const execs = d?.data?.workflowExecutions || [];
+        s.totalRunsSampled = execs.length;
+        if (execs.length > 0) {
+          s.lastRunAt = execs[0].createdTime || null;
+          s.lastRunStatus = execs[0].status || null;
+          s.oldestSampledRun = execs[execs.length - 1].createdTime || null;
+          for (const ex of execs) {
+            if (ex.status === 'success') s.successCount++;
+            else s.failureCount++;
+          }
+        }
+      } catch { /* non-fatal */ }
+      summaries.push(s);
+    }
+    return summaries;
+  }
+
+  // ---------------------------------------------------------------------------
+  // DERIVE: scan automations for integration URLs (static, no browser needed)
+  // ---------------------------------------------------------------------------
+
+  static scanIntegrationEndpoints(automations: any[]): any[] {
+    const endpoints: any[] = [];
+    const urlRegex = /https?:\/\/[^\s"'`<>\]\)\\]+/g;
+    const ignoreDomains = new Set([
+      'airtable.com', 'static.airtable.com', 'dl.airtable.com',
+      'api.airtable.com', 'localhost', '127.0.0.1',
+    ]);
+
+    for (const auto of automations) {
+      const baseId = auto.base_id;
+      const wfRef = auto.name || auto.workflow_id || 'unknown';
+
+      for (const script of (auto.script_sources || [])) {
+        const code = typeof script === 'string' ? script : (script.code || '');
+        const urls = code.match(urlRegex) || [];
+        for (const u of urls) {
+          try {
+            const domain = new URL(u).hostname;
+            if (!ignoreDomains.has(domain)) {
+              endpoints.push({ baseId, sourceKind: 'script', domain, url: u.slice(0, 500), evidenceRef: `Automation: ${wfRef}` });
+            }
+          } catch { /* skip */ }
+        }
+      }
+
+      const cfg = auto.trigger_config;
+      if (cfg) {
+        if (cfg.webhookUrl) {
+          try {
+            endpoints.push({ baseId, sourceKind: 'webhook_trigger', domain: new URL(cfg.webhookUrl).hostname, url: cfg.webhookUrl, evidenceRef: `Trigger: ${wfRef}` });
+          } catch { /* skip */ }
+        }
+        if (cfg.appName || cfg.connectionName) {
+          endpoints.push({ baseId, sourceKind: 'connected_app', domain: (cfg.appName || cfg.connectionName || '').toLowerCase(), url: '', evidenceRef: `Connected app: ${wfRef}` });
+        }
+      }
+    }
+
+    // Deduplicate
+    const seen = new Set<string>();
+    return endpoints.filter(e => {
+      const key = `${e.baseId}:${e.sourceKind}:${e.domain}:${e.url}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Extract admin users from enterprise data (already collected)
+  // ---------------------------------------------------------------------------
+
+  // ---------------------------------------------------------------------------
+  // Extensions: DOM scrape from the extensions panel per base (2.3)
+  // Only called when hasBlockInstallations is true.
+  // Navigates to base?blocks=show, waits for .blockFrame elements,
+  // extracts name, installation ID, block ID from each.
+  // ---------------------------------------------------------------------------
+
+  async collectExtensions(appId: string): Promise<{
+    extensions: Array<{
+      extensionName: string; blockInstallationId: string;
+      blockId: string; isScripting: boolean; scriptCode: string | null;
+    }>;
+    errors: string[];
+  }> {
+    const out = { extensions: [] as any[], errors: [] as string[] };
+    try {
+      // Open extensions panel
+      await this.page.goto(`https://airtable.com/${appId}?blocks=show`, {
+        waitUntil: 'domcontentloaded', timeout: 60_000,
+      });
+      // Wait for block frames to render (up to 15s)
+      try {
+        await this.page.waitForSelector('.blockFrame', { timeout: 15_000 });
+      } catch {
+        // No extensions loaded, or panel didn't open
+        return out;
+      }
+      await new Promise(r => setTimeout(r, 2000)); // let all frames settle
+
+      const extensions = await this.page.evaluate(() => {
+        var frames = document.querySelectorAll('.blockFrame');
+        var results: any[] = [];
+        frames.forEach(function(frame) {
+          // Extension name
+          var nameEl = frame.querySelector('.truncate.no-user-select');
+          var name = nameEl ? nameEl.textContent?.trim() || '' : '';
+          // Installation ID
+          var installEl = frame.querySelector('[data-blockinstallationid]');
+          var installId = installEl ? installEl.getAttribute('data-blockinstallationid') || '' : '';
+          // Block ID from iframe src
+          var iframe = frame.querySelector('iframe[src]');
+          var blockId = '';
+          if (iframe) {
+            var src = iframe.getAttribute('src') || '';
+            var match = src.match(/blockId=([a-zA-Z0-9]+)/);
+            if (match) blockId = match[1];
+          }
+          results.push({ extensionName: name, blockInstallationId: installId, blockId: blockId });
+        });
+        return results;
+      });
+
+      // Check for scripting extensions (name contains "script" or known scripting block IDs)
+      for (const ext of extensions) {
+        const lower = (ext.extensionName || '').toLowerCase();
+        ext.isScripting = lower.includes('script') || lower.includes('custom code');
+        ext.scriptCode = null;
+
+        // If it's a scripting extension, try to click into it and grab the code
+        if (ext.isScripting && ext.blockInstallationId) {
+          try {
+            // Click the extension name to focus/open it
+            const nameEl = await this.page.$(`[data-blockinstallationid="${ext.blockInstallationId}"]`);
+            if (nameEl) {
+              await nameEl.click();
+              await new Promise(r => setTimeout(r, 2000));
+              // Try to get code from CodeMirror editor
+              const code = await this.page.evaluate(() => {
+                // CodeMirror 6
+                var cm = document.querySelector('.cm-content');
+                if (cm) return cm.textContent || '';
+                // Monaco
+                var monaco = document.querySelector('.monaco-editor .view-lines');
+                if (monaco) return monaco.textContent || '';
+                // Fallback: any textarea in the focused block
+                var ta = document.querySelector('.blockFrame textarea');
+                if (ta) return (ta as HTMLTextAreaElement).value || '';
+                return null;
+              });
+              if (code) ext.scriptCode = code;
+            }
+          } catch {
+            // Non-fatal: could not extract script code
+          }
+        }
+      }
+
+      out.extensions = extensions;
+      console.log(`[engine-session] Extensions for ${appId}: ${extensions.length} found, ${extensions.filter((e: any) => e.isScripting).length} scripting`);
+    } catch (err: any) {
+      out.errors.push(`Extensions scrape ${appId}: ${err.message}`);
+    }
+    return out;
+  }
+
+  static extractAdminUsers(enterpriseData: any): any[] {
+    if (!enterpriseData?.users) return [];
+    return (enterpriseData.users || []).map((u: any) => ({
+      userId: u.id || u.userId || '',
+      email: u.email || '',
+      displayName: u.name || u.displayName || null,
+      role: u.seatType || u.role || null,
+      status: u.state || u.status || null,
+      lastActiveAt: u.lastActivityTime || null,
+      createdAtSource: u.createdTime || null,
+      twoFa: u.isTwoFactorAuthEnabled ?? null,
+    }));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Extract billing snapshot from enterprise data (already collected)
+  // ---------------------------------------------------------------------------
+
+  static extractBillingSnapshot(enterpriseData: any, workspaceData: any): any | null {
+    const billing = enterpriseData?.billing;
+    const license = enterpriseData?.licenseSummary;
+    const wsPlan = workspaceData?.billingPlan;
+    if (!billing && !license && !wsPlan) return null;
+
+    return {
+      plan: wsPlan?.name || wsPlan?.grouping || null,
+      paidSeats: license?.totalPaidSeats || license?.aggregateUserLicenseCount || null,
+      addons: workspaceData?.billingAddOnIds || null,
+      nextInvoiceAmount: billing?.nextInvoiceAmount ?? null,
+      nextInvoiceDate: billing?.nextInvoiceDate || null,
+      billingCycle: billing?.billingCycle || billing?.billingInterval || null,
+      businessName: billing?.businessName || billing?.companyName || null,
+      billingContact: billing?.billingContactEmail || null,
+      invoiceHistory: billing?.invoices || billing?.invoiceHistory || null,
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -962,6 +1402,11 @@ export class SessionEngine {
   }
 
   private async fetchDeployment(wfdId: string, appId: string): Promise<any | null> {
+    const raw = await this.fetchRawDeployment(wfdId, appId);
+    return raw?.workflowDefinition ?? null;
+  }
+
+  private async fetchRawDeployment(wfdId: string, appId: string): Promise<any | null> {
     const result = await this.page.evaluate(
       async ({ wfdId, headers }: { wfdId: string; headers: Record<string, string> }) => {
         const res = await fetch(
@@ -973,8 +1418,7 @@ export class SessionEngine {
       },
       { wfdId, headers: this.makeHeaders(appId) },
     );
-    // Confirmed shape: data.workflowDeployment.workflowDefinition
-    return result?.data?.workflowDeployment?.workflowDefinition ?? null;
+    return result?.data?.workflowDeployment ?? null;
   }
 
   // ---------------------------------------------------------------------------
@@ -1007,32 +1451,40 @@ export class SessionEngine {
       stepCount:        allNodes.length,
       actionTypes,
       scriptSources:    [],
+      createdByUserId:  null,
+      deploymentCreatedTime: null,
     };
 
-    // Fetch script bodies -- one deployment read per automation
-    if (scriptNodes.length > 0 && deploymentId) {
+    // Fetch script bodies + authorship -- one deployment read per automation
+    if (deploymentId) {
       try {
-        const definition = await this.fetchDeployment(deploymentId, appId);
-        const deployedById: Record<string, any> = definition?.graph?.actionsById ?? {};
+        const rawDeployment = await this.fetchRawDeployment(deploymentId, appId);
+        // Authorship from the deployment wrapper
+        result.createdByUserId = rawDeployment?.createdByUserId ?? null;
+        result.deploymentCreatedTime = rawDeployment?.createdTime ?? null;
 
-        scriptNodes.forEach((node, i) => {
-          // Match by ID; fall back to first script action found in deployment
-          const deployed =
-            deployedById[node.id] ??
-            Object.values(deployedById).find(
-              (a: any) => a.workflowActionTypeId === 'watCUSTOMSCRIPT00',
-            );
-          const code: string = deployed?.inputExpressions?.script?.value ?? '';
-          result.scriptSources.push({
-            actionId:   node.id,
-            stepIndex:  i,
-            actionType: node.workflowActionTypeId ?? 'unknown',
-            lines:      code ? code.split('\n').length : 0,
-            code,
+        const definition = rawDeployment?.workflowDefinition ?? null;
+        if (definition && scriptNodes.length > 0) {
+          const deployedById: Record<string, any> = definition?.graph?.actionsById ?? {};
+
+          scriptNodes.forEach((node, i) => {
+            const deployed =
+              deployedById[node.id] ??
+              Object.values(deployedById).find(
+                (a: any) => a.workflowActionTypeId === 'watCUSTOMSCRIPT00',
+              );
+            const code: string = deployed?.inputExpressions?.script?.value ?? '';
+            result.scriptSources.push({
+              actionId:   node.id,
+              stepIndex:  i,
+              actionType: node.workflowActionTypeId ?? 'unknown',
+              lines:      code ? code.split('\n').length : 0,
+              code,
+            });
           });
-        });
+        }
       } catch (err: any) {
-        result.error = `script fetch failed: ${err.message}`;
+        result.error = `deployment fetch failed: ${err.message}`;
       }
     }
 
