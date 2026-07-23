@@ -318,7 +318,7 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
           try {
             await store.event('bootstrap', `Bootstrap read: ${baseName ?? baseId}`);
             // Pass table IDs from schema to get row counts
-            const tblIds = tables.map((t: any) => t.id);
+            const tblIds = null; // TODO: batch per-table for row counts
             const bootstrap = await session.collectBootstrapRead(baseId, tblIds);
 
             if (bootstrap.syncLinks.length > 0) {

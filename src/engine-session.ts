@@ -541,202 +541,114 @@ export class SessionEngine {
   // returns JSON. Needs x-time-zone + x-airtable-application-id headers.
   // ---------------------------------------------------------------------------
 
-  async collectBootstrapRead(appId: string, tableIds?: string[]): Promise<{
-    syncLinks: any[];
-    shares: any[];
-    tableStats: any[];
-    hasExtensions: boolean | null;
-    aiConsumption: { creditsMonth: number; creditsRemaining: number } | null;
-    revisionHistoryEnabled: boolean | null;
-    errors: string[];
-  }> {
-    const out = { syncLinks: [] as any[], shares: [] as any[], tableStats: [] as any[],
-      hasExtensions: null as boolean | null, aiConsumption: null as any, revisionHistoryEnabled: null as boolean | null,
-      errors: [] as string[] };
-
+  async collectBootstrapRead(appId, tableIds) {
+    const out = { syncLinks: [], shares: [], tableStats: [], hasExtensions: null, aiConsumption: null, revisionHistoryEnabled: null, errors: [] };
     try {
-      // Navigate to the base to activate cookies
-      await this.page.goto(`https://airtable.com/${appId}`, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-      await new Promise(r => setTimeout(r, 5000));
+      const params = {
+        includeDataForTableIds: tableIds,
+        includeDataForViewIds: null,
+        shouldIncludeSchemaChecksum: false,
+        mayOnlyIncludeRowAndCellDataForIncludedViews: false,
+        mayExcludeCellDataForLargeViews: false,
+        allowMsgpackOfResult: false,
+        canClientSupportPreviewMode: false,
+      };
+      const url = '/v0.3/application/' + appId + '/read?stringifiedObjectParams=' + encodeURIComponent(JSON.stringify(params));
+      console.log('[DEBUG] About to call fetchInternalApi for bootstrap, url length:', url.length, 'appId:', appId);
+      const data = await this.fetchInternalApi(url, appId);
+      console.log('[DEBUG] fetchInternalApi returned:', data === null ? 'NULL' : typeof data, data?.__error ? 'ERROR' : 'ok');
+      const d = data?.data || data || {};
 
-      const payload = await this.page.evaluate(
-        async (args: { appId: string; tableIds: string[] | null }) => {
-          const params: Record<string, any> = {
-            includeDataForTableIds: args.tableIds,
-            includeDataForViewIds: null,
-            shouldIncludeSchemaChecksum: false,
-            mayOnlyIncludeRowAndCellDataForIncludedViews: true,
-            mayExcludeCellDataForLargeViews: true,
-            allowMsgpackOfResult: false,
-            canClientSupportPreviewMode: false,
-          };
-          var url =
-            '/v0.3/application/' + args.appId + '/read?stringifiedObjectParams=' +
-            encodeURIComponent(JSON.stringify(params));
-          var resp = await fetch(url, {
-            headers: {
-              'accept': 'application/json',
-              'x-airtable-inter-service-client': 'webClient',
-              'x-requested-with': 'XMLHttpRequest',
-              'x-time-zone': 'UTC',
-              'x-airtable-application-id': args.appId,
-            },
+      // Sync links
+      const schemas = d.tableSchemas || [];
+      for (const ts of schemas) {
+        const syncById = ts.externalTableSyncById || {};
+        const syncIds = Object.keys(syncById);
+        const isMulti = syncIds.length > 1;
+        for (const syncId of syncIds) {
+          const se = syncById[syncId];
+          out.syncLinks.push({
+            destTableId: ts.id || null, syncId,
+            sourceType: se?.dataSourceConfig?.dataSourceType || 'unknown',
+            sourceAccountId: se?.dataSourceConfig?.externalAccountId || null,
+            syncState: se?.syncState || null, isMultiSource: isMulti,
+            fieldMapping: se?.dataSourceConfig?.externalFieldIdByColumnId || null,
           });
-          if (!resp.ok) return { _err: 'HTTP ' + resp.status };
-          var ct = resp.headers.get('content-type') || '';
-          if (!ct.includes('json')) return { _err: 'not JSON: ' + ct };
-          var json = await resp.json();
-          var d = json.data || json;
-
-          // Sync links from tableSchemas
-          var syncLinks: any[] = [];
-          var schemas = d.tableSchemas || [];
-          for (var si = 0; si < schemas.length; si++) {
-            var ts = schemas[si];
-            var syncById = ts.externalTableSyncById || {};
-            var syncIds = Object.keys(syncById);
-            var isMulti = syncIds.length > 1;
-            for (var sk = 0; sk < syncIds.length; sk++) {
-              var syncId = syncIds[sk];
-              var se = syncById[syncId];
-              syncLinks.push({
-                destTableId: ts.id || null,
-                syncId: syncId,
-                sourceType: (se.dataSourceConfig || {}).dataSourceType || 'unknown',
-                sourceAccountId: (se.dataSourceConfig || {}).externalAccountId || null,
-                syncState: se.syncState || null,
-                isMultiSource: isMulti,
-                fieldMapping: (se.dataSourceConfig || {}).externalFieldIdByColumnId || null,
-              });
-            }
-            var tgt = ts.externalTableSyncTargetConfiguration;
-            if (tgt && syncIds.length > 0) {
-              var first = syncLinks[syncLinks.length - syncIds.length];
-              if (first) {
-                first.syncState = tgt.syncState || first.syncState;
-                first.lastSuccessTime = tgt.lastSuccessTime || null;
-                first.lastFailureTime = tgt.lastFailureTime || null;
-                first.lastFailureInfo = tgt.lastFailureInfo || null;
-                first.syncFrequency = (tgt.metadata || {}).syncFrequency || null;
-                first.shouldSyncRowDeletions = (tgt.metadata || {}).shouldSyncRowDeletions;
-                first.resyncTime = tgt.resyncTime || null;
-              }
-            }
+        }
+        const tgt = ts.externalTableSyncTargetConfiguration;
+        if (tgt && syncIds.length > 0) {
+          const first = out.syncLinks[out.syncLinks.length - syncIds.length];
+          if (first) {
+            first.syncState = tgt.syncState || first.syncState;
+            first.lastSuccessTime = tgt.lastSuccessTime || null;
+            first.lastFailureTime = tgt.lastFailureTime || null;
+            first.lastFailureInfo = tgt.lastFailureInfo || null;
+            first.syncFrequency = tgt.metadata?.syncFrequency || null;
+            first.shouldSyncRowDeletions = tgt.metadata?.shouldSyncRowDeletions;
+            first.resyncTime = tgt.resyncTime || null;
           }
-
-          // Share links from sharesById
-          var shares: any[] = [];
-          var sharesMap = d.sharesById || {};
-          var shareKeys = Object.keys(sharesMap);
-          for (var shi = 0; shi < shareKeys.length; shi++) {
-            var sid = shareKeys[shi];
-            var sh = sharesMap[sid];
-            shares.push({
-              shareId: sid,
-              kind: sh.type || sh.shareType || null,
-              isPasswordProtected: sh.isPasswordProtected || false,
-              isDomainRestricted: sh.restrictedDomains ? true : false,
-            });
-          }
-
-          // Table stats from tableDatas (if table IDs were included)
-          var tableStats: any[] = [];
-          var tableDatas = d.tableDatas || [];
-          if (Array.isArray(tableDatas)) {
-            for (var ti = 0; ti < tableDatas.length; ti++) {
-              var td = tableDatas[ti];
-              if (td && td.id) {
-                tableStats.push({
-                  tableId: td.id,
-                  tableName: td.name || null,
-                  rowCount: td.rowCount != null ? td.rowCount : (td.rows ? td.rows.length : null),
-                });
-              }
-            }
-          } else if (tableDatas && typeof tableDatas === 'object') {
-            var tdKeys = Object.keys(tableDatas);
-            for (var tdi = 0; tdi < tdKeys.length; tdi++) {
-              var tdk = tdKeys[tdi];
-              var tdv = tableDatas[tdk];
-              if (tdv) {
-                tableStats.push({
-                  tableId: tdk,
-                  tableName: tdv.name || null,
-                  rowCount: tdv.rowCount != null ? tdv.rowCount : (tdv.rows ? tdv.rows.length : null),
-                });
-              }
-            }
-          }
-
-          // Extensions, AI consumption, revision history
-          var hasExtensions = d.hasBlockInstallations || false;
-          var revisionHistoryEnabled = d.isRevisionHistoryEnabled || false;
-          var aiConsumption = null;
-          var aiInfo = d.aiConsumptionInfo;
-          if (aiInfo) {
-            aiConsumption = {
-              creditsMonth: aiInfo.creditsConsumedForMonth || 0,
-              creditsRemaining: aiInfo.remainingCreditsForMonth || 0,
-            };
-          }
-
-          return { syncLinks: syncLinks, shares: shares, tableStats: tableStats,
-            hasExtensions: hasExtensions, aiConsumption: aiConsumption, revisionHistoryEnabled: revisionHistoryEnabled };
-        },
-        { appId, tableIds: tableIds ?? null },
-      );
-
-      if ((payload as any)._err) {
-        out.errors.push(`Bootstrap read ${appId}: ${(payload as any)._err}`);
-        return out;
+        }
       }
 
-      out.syncLinks = (payload as any).syncLinks || [];
-      out.shares = (payload as any).shares || [];
-      out.tableStats = (payload as any).tableStats || [];
-      out.hasExtensions = (payload as any).hasExtensions ?? null;
-      out.aiConsumption = (payload as any).aiConsumption ?? null;
-      out.revisionHistoryEnabled = (payload as any).revisionHistoryEnabled ?? null;
-      console.log(`[engine-session] Bootstrap ${appId}: ${out.syncLinks.length} sync, ${out.shares.length} shares, ${out.tableStats.length} table stats, extensions=${out.hasExtensions}, ai=${out.aiConsumption?.creditsMonth ?? 'n/a'}`);
-    } catch (err: any) {
-      out.errors.push(`Bootstrap read ${appId}: ${err.message}`);
+      // Shares
+      const sharesMap = d.sharesById || {};
+      for (const [sid, sh] of Object.entries(sharesMap)) {
+        out.shares.push({
+          shareId: sid, kind: sh.type || sh.shareType || null,
+          isPasswordProtected: sh.isPasswordProtected || false,
+          isDomainRestricted: sh.restrictedDomains ? true : false,
+        });
+      }
+
+      // Table stats
+      const tableDatas = d.tableDatas || [];
+      const tdArr = Array.isArray(tableDatas) ? tableDatas : Object.entries(tableDatas).map(([id, v]) => ({ id, ...v }));
+      for (const td of tdArr) {
+        if (td?.id) {
+          out.tableStats.push({ tableId: td.id, tableName: td.name || null, rowCount: td.rowCount != null ? td.rowCount : (td.rows ? td.rows.length : null) });
+        }
+      }
+
+      // Extras
+      out.hasExtensions = d.hasBlockInstallations || false;
+      out.revisionHistoryEnabled = d.isRevisionHistoryEnabled || false;
+      if (d.aiConsumptionInfo) {
+        out.aiConsumption = { creditsMonth: d.aiConsumptionInfo.creditsConsumedForMonth || 0, creditsRemaining: d.aiConsumptionInfo.remainingCreditsForMonth || 0 };
+      }
+
+      console.log('[engine-session] Bootstrap ' + appId + ': ' + out.syncLinks.length + ' sync, ' + out.shares.length + ' shares, ' + out.tableStats.length + ' table stats, ext=' + out.hasExtensions);
+    } catch (err) {
+      out.errors.push('Bootstrap read ' + appId + ': ' + err.message);
     }
     return out;
   }
 
-  // ---------------------------------------------------------------------------
-  // Interfaces: listApplicationsAndPageBundlesForDisplay (one call, all bases)
-  // ---------------------------------------------------------------------------
-
-  async collectAllInterfaces(): Promise<{ interfaces: any[]; errors: string[] }> {
-    const out = { interfaces: [] as any[], errors: [] as string[] };
+  async collectAllInterfaces() {
+    const out = { interfaces: [], errors: [] };
     try {
-      await this.page.goto('https://airtable.com/', { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      await this.page.goto("https://airtable.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
       await new Promise(r => setTimeout(r, 3000));
 
-      const data = await this.page.evaluate(async () => {
-        var html = document.documentElement.innerHTML;
-        var um = html.match(/"userId"\s*:\s*"(usr[a-zA-Z0-9]+)"/);
-        if (!um) return { _err: 'no userId' };
-        var params = { shouldIncludePageBundleSharingApplications: true, shouldIncludePageBundleIndex: true };
-        var url = '/v0.3/user/' + um[1] + '/listApplicationsAndPageBundlesForDisplay?stringifiedObjectParams=' + encodeURIComponent(JSON.stringify(params));
-        var resp = await fetch(url, { headers: { 'x-airtable-inter-service-client': 'webClient', 'x-requested-with': 'XMLHttpRequest' } });
-        if (!resp.ok) return { _err: 'HTTP ' + resp.status };
-        var json = await resp.json();
-        var d = json.data || json;
-        var pbs = d.pageBundles || [];
-        return {
-          interfaces: pbs.map(function(pb: any) {
-            return { baseId: pb.applicationId, interfaceId: pb.id, name: pb.name || null, createdTime: pb.createdTime || null, firstPublishedTime: pb.firstPagePublishedTime || null };
-          }),
-        };
+      // Extract userId from page HTML
+      const userId = await this.page.evaluate(function() {
+        var m = document.documentElement.innerHTML.match(/"userId":"(usr[a-zA-Z0-9]+)"/);
+        return m ? m[1] : null;
       });
+      if (!userId) { out.errors.push("no userId found"); return out; }
 
-      if ((data as any)._err) { out.errors.push((data as any)._err); return out; }
-      out.interfaces = (data as any).interfaces || [];
-      console.log(`[engine-session] Collected ${out.interfaces.length} interface(s)`);
-    } catch (err: any) {
-      out.errors.push(`Interfaces: ${err.message}`);
+      // Fetch interfaces via fetchInternalApi
+      var params = { shouldIncludePageBundleSharingApplications: true, shouldIncludePageBundleIndex: true };
+      var url = "/v0.3/user/" + userId + "/listApplicationsAndPageBundlesForDisplay?stringifiedObjectParams=" + encodeURIComponent(JSON.stringify(params));
+      var data = await this.fetchInternalApi(url);
+      if (!data) { out.errors.push("fetchInternalApi returned null"); return out; }
+      var d = data.data || data;
+      var pbs = d.pageBundles || [];
+      out.interfaces = pbs.map(function(pb) {
+        return { baseId: pb.applicationId, interfaceId: pb.id, name: pb.name || null, createdTime: pb.createdTime || null, firstPublishedTime: pb.firstPagePublishedTime || null };
+      });
+      console.log("[engine-session] Collected " + out.interfaces.length + " interface(s)");
+    } catch (err) {
+      out.errors.push("Interfaces: " + err.message);
     }
     return out;
   }
@@ -1319,24 +1231,29 @@ export class SessionEngine {
   }
 
   /** Generic internal API fetcher via page.evaluate (same-origin, session cookies) */
-  private async fetchInternalApi(path: string): Promise<any> {
+  private async fetchInternalApi(path: string, appId?: string): Promise<any> {
     console.log(`[engine-session] fetchInternalApi: ${path.substring(0, 80)}...`);
-    const result = await this.page.evaluate(async (url: string) => {
+        const arg = JSON.stringify({ url: path, aid: appId || "" });
+    const result = await this.page.evaluate(async (argStr) => {
+      var parsed = JSON.parse(argStr);
       try {
-        const res = await fetch(url, {
+        var res = await fetch(parsed.url, {
           headers: {
             'x-airtable-inter-service-client': 'webClient',
             'x-requested-with': 'XMLHttpRequest',
+            'x-time-zone': 'UTC',
+            'accept': 'application/json',
+            ...(parsed.aid ? {'x-airtable-application-id': parsed.aid} : {}),
           },
         });
         if (!res.ok) {
-          return { __error: true, status: res.status, statusText: res.statusText, url };
+          var errBody = ''; try { errBody = await res.text(); } catch(e) {} return { __error: true, status: res.status, body: errBody.slice(0,300), url: parsed.url };
         }
         return await res.json();
       } catch (e: any) {
-        return { __error: true, message: e.message, url };
+        return { __error: true, message: e.message, url: parsed.url };
       }
-    }, path);
+    }, arg);
 
     if (result?.__error) {
       console.error(`[engine-session] fetchInternalApi FAILED: ${JSON.stringify(result)}`);
