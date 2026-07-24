@@ -555,7 +555,7 @@ export class SessionEngine {
       };
       const url = '/v0.3/application/' + appId + '/read?stringifiedObjectParams=' + encodeURIComponent(JSON.stringify(params));
       console.log('[DEBUG] About to call fetchInternalApi for bootstrap, url length:', url.length, 'appId:', appId);
-      const data = await this.fetchInternalApi(url, appId);
+      const data = await this.fetchInternalApi(url, appId, 120_000); // 120s for large bootstrap payloads
       console.log('[DEBUG] fetchInternalApi returned:', data === null ? 'NULL' : typeof data, data?.__error ? 'ERROR' : 'ok');
       const d = data?.data || data || {};
 
@@ -1231,10 +1231,11 @@ export class SessionEngine {
   }
 
   /** Generic internal API fetcher via page.evaluate (same-origin, session cookies) */
-  private async fetchInternalApi(path: string, appId?: string): Promise<any> {
+  private async fetchInternalApi(path: string, appId?: string, timeoutMs = 90_000): Promise<any> {
     console.log(`[engine-session] fetchInternalApi: ${path.substring(0, 80)}...`);
-        const arg = JSON.stringify({ url: path, aid: appId || "" });
-    const result = await this.page.evaluate(async (argStr) => {
+    const arg = JSON.stringify({ url: path, aid: appId || "" });
+
+    const fetchPromise = this.page.evaluate(async (argStr) => {
       var parsed = JSON.parse(argStr);
       try {
         var res = await fetch(parsed.url, {
@@ -1254,6 +1255,12 @@ export class SessionEngine {
         return { __error: true, message: e.message, url: parsed.url };
       }
     }, arg);
+
+    const timeoutPromise = new Promise<{ __error: true; message: string; url: string }>((resolve) =>
+      setTimeout(() => resolve({ __error: true, message: `fetchInternalApi timed out after ${timeoutMs / 1000}s`, url: path }), timeoutMs),
+    );
+
+    const result = await Promise.race([fetchPromise, timeoutPromise]);
 
     if (result?.__error) {
       console.error(`[engine-session] fetchInternalApi FAILED: ${JSON.stringify(result)}`);

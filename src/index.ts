@@ -228,7 +228,8 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
     }
 
     let baseIndex = 0;
-    const RESTART_EVERY = 15; // Restart browser every N bases to prevent memory exhaustion
+    const RESTART_EVERY = 10; // Restart browser every N bases to prevent memory exhaustion
+    const BASE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes max per base
 
     for (const { baseId, baseName } of targets) {
       // Periodic browser restart to prevent Chromium memory crashes
@@ -242,6 +243,7 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
       }
       baseIndex++;
 
+      const baseStartTime = Date.now();
       try {
         await store.event('schema', `Schema: ${baseName ?? baseId}`);
         const { tables, tableCount, fieldCount } = await patEngine.getBaseSchema(baseId);
@@ -397,10 +399,22 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
         }
 
         await store.upsertBaseStatus(baseId, 'complete');
+        const elapsed = ((Date.now() - baseStartTime) / 1000).toFixed(1);
+        await store.event('schema', `Base ${baseName ?? baseId} complete in ${elapsed}s`);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        await store.event('schema', `Base ${baseId} failed: ${msg}`, 'error');
+        const isTimeout = msg.includes('timed out after');
+        await store.event('schema', `Base ${baseId} failed${isTimeout ? ' (timeout)' : ''}: ${msg}`, 'error');
         await store.upsertBaseStatus(baseId, 'failed', msg);
+        // If timeout, browser may be in bad state; restart it
+        if (isTimeout && (audit.config?.collect_collaborators || wantEnv)) {
+          try {
+            await store.event('browser', 'Restarting browser after timeout');
+            await session.restartBrowser(clientProfileDir);
+          } catch (re: any) {
+            await store.event('browser', `Post-timeout restart failed: ${re.message}`, 'warn');
+          }
+        }
       }
     }
 
