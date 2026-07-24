@@ -419,8 +419,8 @@ export class SessionEngine {
     try {
       // Navigate to automations tab to bootstrap context
       await this.page.goto(`https://airtable.com/${appId}/automations`, {
-        waitUntil: 'networkidle',
-        timeout: 60_000,
+        waitUntil: 'domcontentloaded',
+        timeout: 90_000,
       });
       await new Promise((r) => setTimeout(r, 3000));
 
@@ -771,7 +771,7 @@ export class SessionEngine {
     try {
       // Open extensions panel
       await this.page.goto(`https://airtable.com/${appId}?blocks=show`, {
-        waitUntil: 'domcontentloaded', timeout: 60_000,
+        waitUntil: 'domcontentloaded', timeout: 90_000,
       });
       // Wait for block frames to render (up to 15s)
       try {
@@ -1151,8 +1151,8 @@ export class SessionEngine {
 
     // Navigate to the automations page (known to fully bootstrap the app shell)
     await this.page.goto(`https://airtable.com/${baseId}/automations`, {
-      waitUntil: 'networkidle',
-      timeout: 60_000,
+      waitUntil: 'domcontentloaded',
+      timeout: 90_000,
     });
     await new Promise((r) => setTimeout(r, 5000));
 
@@ -1277,8 +1277,8 @@ export class SessionEngine {
     // Navigate to the automations tab so Airtable bootstraps its full app
     // context -- required before the internal API will respond correctly.
     await this.page.goto(`https://airtable.com/${appId}/automations`, {
-      waitUntil: 'networkidle',
-      timeout: 60_000,
+      waitUntil: 'domcontentloaded',
+      timeout: 90_000,
     });
     await new Promise((r) => setTimeout(r, 3000));
 
