@@ -264,7 +264,13 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
             // Re-navigate to base for subsequent steps (automations etc)
             // since collaborator scraping may have navigated away
           } catch (e: any) {
-            await store.event('collaborators', `Collaborator scraping failed: ${e.message}`, 'warn');
+            const crashMsg = e.message || '';
+            const collabCrash = crashMsg.includes('Page crashed') || crashMsg.includes('Target closed');
+            await store.event('collaborators', `Collaborator collection failed: ${crashMsg}`, 'warn');
+            if (collabCrash) {
+              await store.event('browser', 'Restarting browser after collaborator crash');
+              try { await session.restartBrowser(clientProfileDir); } catch (_) {}
+            }
           }
         }
 
@@ -404,15 +410,16 @@ async function runAudit(audit: any, baseConfig: ReturnType<typeof loadBaseConfig
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         const isTimeout = msg.includes('timed out after');
-        await store.event('schema', `Base ${baseId} failed${isTimeout ? ' (timeout)' : ''}: ${msg}`, 'error');
+        const isCrash = msg.includes('Page crashed') || msg.includes('Target closed') || msg.includes('Protocol error');
+        await store.event('schema', `Base ${baseId} failed${isTimeout ? ' (timeout)' : isCrash ? ' (crash)' : ''}: ${msg}`, 'error');
         await store.upsertBaseStatus(baseId, 'failed', msg);
-        // If timeout, browser may be in bad state; restart it
-        if (isTimeout && (audit.config?.collect_collaborators || wantEnv)) {
+        // If crash or timeout, browser is in a bad state; restart immediately
+        if ((isTimeout || isCrash) && (audit.config?.collect_collaborators || wantEnv)) {
           try {
-            await store.event('browser', 'Restarting browser after timeout');
+            await store.event('browser', `Restarting browser after ${isCrash ? 'crash' : 'timeout'}`);
             await session.restartBrowser(clientProfileDir);
           } catch (re: any) {
-            await store.event('browser', `Post-timeout restart failed: ${re.message}`, 'warn');
+            await store.event('browser', `Post-crash restart failed: ${re.message}`, 'warn');
           }
         }
       }
